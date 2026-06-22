@@ -25,28 +25,44 @@ class ArUcoDetector:
         self.dist_coeffs = DIST_COEFFS
 
     def process_frame(self, frame):
+        """
+        Возвращает:
+            vis_frame         – кадр с разметкой
+            markers           – список словарей: [{'id': int, 'coords': [x,y,z], 'corners': array}, ...]
+        """
         if frame is None:
-            return frame, None, None, None, None
+            return frame, []
 
         corners, ids, _ = self.detector.detectMarkers(frame)
-        coords = None
-        x_center = y_center = None
+        markers = []
 
         if ids is not None and len(ids) > 0:
             cv2.aruco.drawDetectedMarkers(frame, corners, ids)
 
-            c = corners[0][0]
-            x_center = int(np.mean([p[0] for p in c]))
-            y_center = int(np.mean([p[1] for p in c]))
-            cv2.circle(frame, (x_center, y_center), 5, (0, 0, 255), -1)
+            for i, marker_id in enumerate(ids.flatten()):
+                # центр маркера
+                c = corners[i][0]
+                x_center = int(np.mean([p[0] for p in c]))
+                y_center = int(np.mean([p[1] for p in c]))
+                cv2.circle(frame, (x_center, y_center), 5, (0, 0, 255), -1)
 
-            success, rvecs, tvecs = cv2.solvePnP(
-                self.marker_points,
-                corners[0],
-                self.camera_matrix,
-                self.dist_coeffs
-            )
-            if success:
-                coords = [tvecs[0][0], tvecs[1][0], tvecs[2][0]]
+                # координаты в пространстве
+                success, rvecs, tvecs = cv2.solvePnP(
+                    self.marker_points,
+                    corners[i],
+                    self.camera_matrix,
+                    self.dist_coeffs
+                )
+                if success:
+                    coords = [tvecs[0][0], tvecs[1][0], tvecs[2][0]]
+                else:
+                    coords = None
 
-        return frame, coords, x_center, y_center, ids
+                markers.append({
+                    'id': int(marker_id),
+                    'coords': coords,
+                    'corners': corners[i],
+                    'center': (x_center, y_center)
+                })
+
+        return frame, markers
