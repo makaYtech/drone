@@ -25,6 +25,7 @@ class DroneGlobalController:
     def land(self):
         if self.in_air:
             self.drone.land()
+            self.drone.disarm()
             self.in_air = False
 
     def set_manual_speed(self, vx=0, vy=0, vz=0, yaw_rate=0):
