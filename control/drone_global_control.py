@@ -9,16 +9,19 @@ class DroneGlobalController:
         self.armed = False
         self.in_air = False
         self._last_hold_time = 0
+        
+        # Для гашения инерции
+        self.inertia_compensating = False
+        self.inertia_end_time = 0.0
 
     def arm(self):
         if not self.armed:
             self.drone.arm()
             self.armed = True
 
-    def takeoff(self, altitude=2.0):
+    def takeoff(self, altitude=5.0):
         if not self.in_air:
             self.drone.takeoff()
-            self.drone.go_to_local_point(0, 0, altitude, 0)
             self.in_air = True
             time.sleep(2)
 
@@ -38,3 +41,18 @@ class DroneGlobalController:
         if now - self._last_hold_time > 0.5:
             self.drone.go_to_local_point_body_fixed(x=0, y=0, z=0, yaw=0)
             self._last_hold_time = now
+
+    def stop_with_inertia(self):
+        """Гасит инерцию: подаёт небольшую скорость назад на 0.3 секунды."""
+        self.set_manual_speed(vx=0, vy=-0.5 * FORWARD_SPEED, vz=0, yaw_rate=0)
+        time.sleep(0.3)
+        self.set_manual_speed(vx=0, vy=0, vz=0, yaw_rate=0)
+
+    def update_inertia(self):
+        """Вызывается в главном цикле для поддержания гашения инерции."""
+        if self.inertia_compensating:
+            if time.time() >= self.inertia_end_time:
+                self.set_manual_speed(vx=0, vy=0, vz=0, yaw_rate=0)
+                self.inertia_compensating = False
+            else:
+                self.set_manual_speed(vx=0, vy=-0.5 * FORWARD_SPEED, vz=0, yaw_rate=0)
