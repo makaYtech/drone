@@ -3,7 +3,6 @@ import time
 import math
 import numpy as np
 from typing import List, Dict
-from config import FORWARD_SPEED, YAW_SPEED
 
 class Mission:
     def __init__(self, drone_controller, initial_yaw: float = 0, target_groups: int = 4):
@@ -12,40 +11,49 @@ class Mission:
         self.collected = []
         self.map_data = []
 
+        # Размер одного квадрата и шаг спирали
+        self.SQUARE_SIZE = 1.0
+        self.SPIRAL_STEP = 0.1  # шаг спирали внутри квадрата
+        
+        # Калибровка
+        self.CALIBRATION_DISTANCE = 10.0  # эталонное расстояние для калибровки
+
         # Состояния
         self.STATE_WAITING = "waiting"
-        self.STATE_SEARCH_FIRST = "search_first"
-        self.STATE_APPROACHING = "approaching"
-        self.STATE_RECORDING = "recording"
-        self.STATE_MEASURE_GAP = "measure_gap"
-        self.STATE_NAVIGATE = "navigate"
-        self.STATE_RETURN_TO_LAST = "return_to_last"
-        self.STATE_TURN_90 = "turn_90"
+        self.STATE_GO_TO_ORIGIN = "go_to_origin"
+        self.STATE_CALIBRATION = "calibration"
+        self.STATE_RETURN_TO_ORIGIN = "return_to_origin"
+        self.STATE_SCAN_SQUARE = "scan_square"
+        self.STATE_DECIDE_NEXT = "decide_next"
+        self.STATE_MOVE_TO_SQUARE = "move_to_square"
         self.STATE_RETURN_HOME = "return_home"
         self.STATE_DONE = "done"
 
         self.state = self.STATE_WAITING
         self.state_start_time = time.time()
 
-        # Одометрия
-        self.x = 0.0
-        self.y = 0.0
-        self.yaw = initial_yaw
-        self.last_update_time = time.time()
-        
-        self.current_vx = 0.0
-        self.current_vy = 0.0
-        self.current_yaw_rate = 0.0
+        # Калибровка
+        self.calibration_time = 0.0
+        self.calibration_start_time = 0.0
+        self.effective_speed = 0.0
 
-        # Переменные миссии
-        self.anchor_pos = (0.0, 0.0)
-        self.gap_distance = 0.0
-        self.distance_to_fly = 0.0
-        self.rotation_attempts = 0
-        
-        self.found_4x4 = None
-        self.found_5x5 = None
-        self.target_marker_id = None
+        # Спираль
+        self.spiral_points = []
+        self.current_spiral_idx = 0
+        self.recorded_pairs = set()
+
+        # Управление полётом по точкам
+        self.target_point_sent = False
+        self.command_sent_time = 0.0
+        self.point_reached_time = 0.0
+        self.current_target_pos = (0.0, 0.0)
+        self.expected_flight_time = 0.0
+
+        # Логика обхода квадратов
+        self.current_square = (0, 0)  # (x_offset, y_offset) — смещение левого нижнего угла
+        self.last_square_with_markers = (0, 0)
+        self.direction = "forward"  # "forward" — наращиваем Y, "side" — наращиваем X
+        self.squares_with_markers = []  # список квадратов, где нашли метки
 
     def start(self):
         self.state = self.STATE_WAITING
@@ -53,291 +61,277 @@ class Mission:
         print("[Mission] Миссия запущена, ожидание 2 секунды...")
 
     def update(self, markers: List[Dict]) -> str:
-        self._update_odometry()
-        
         if self.state == self.STATE_DONE:
             return "done"
 
         if self.state == self.STATE_WAITING:
             self._handle_waiting()
-        elif self.state == self.STATE_SEARCH_FIRST:
-            self._handle_search_first(markers)
-        elif self.state == self.STATE_APPROACHING:
-            self._handle_approaching(markers)
-        elif self.state == self.STATE_RECORDING:
-            self._handle_recording(markers)
-        elif self.state == self.STATE_MEASURE_GAP:
-            self._handle_measure_gap(markers)
-        elif self.state == self.STATE_NAVIGATE:
-            self._handle_navigate(markers)
-        elif self.state == self.STATE_RETURN_TO_LAST:
-            self._handle_return_to_last()
-        elif self.state == self.STATE_TURN_90:
-            self._handle_turn_90()
+        elif self.state == self.STATE_GO_TO_ORIGIN:
+            self._handle_go_to_origin()
+        elif self.state == self.STATE_CALIBRATION:
+            self._handle_calibration()
+        elif self.state == self.STATE_RETURN_TO_ORIGIN:
+            self._handle_return_to_origin()
+        elif self.state == self.STATE_SCAN_SQUARE:
+            self._handle_scan_square(markers)
+        elif self.state == self.STATE_DECIDE_NEXT:
+            self._handle_decide_next()
+        elif self.state == self.STATE_MOVE_TO_SQUARE:
+            self._handle_move_to_square()
         elif self.state == self.STATE_RETURN_HOME:
             self._handle_return_home()
 
         return self.state
 
-    def _update_odometry(self):
-        now = time.time()
-        dt = now - self.last_update_time
-        self.last_update_time = now
-        if dt > 0.5: dt = 0.5
-        
-        # vy - вперёд, vx - влево. yaw=0 это ось +Y
-        dx = (self.current_vy * math.sin(self.yaw) - self.current_vx * math.cos(self.yaw)) * dt
-        dy = (self.current_vy * math.cos(self.yaw) + self.current_vx * math.sin(self.yaw)) * dt
-        
-        self.x += dx
-        self.y += dy
-        self.yaw += self.current_yaw_rate * dt
-        self.yaw = (self.yaw + math.pi) % (2 * math.pi) - math.pi
+    def _send_point(self, x, y):
+        """Отправляет команду на полёт и вычисляет ожидаемое время."""
+        current_x, current_y = self.current_target_pos
+        distance = math.sqrt((x - current_x)**2 + (y - current_y)**2)
 
-    def _set_speed(self, vx, vy, vz, yaw_rate):
-        self.current_vx = vx
-        self.current_vy = vy
-        self.current_yaw_rate = yaw_rate
-        self.drone.set_manual_speed(vx, vy, vz, yaw_rate)
-    
-    def _stop(self):
-        self._set_speed(0, 0, 0, 0)
+        if self.effective_speed > 0:
+            self.expected_flight_time = distance / self.effective_speed + 1.0
+        else:
+            self.expected_flight_time = 5.0
 
-    def _check_inertia_stop(self):
-        """НЕБЛОКИРУЮЩЕЕ гашение инерции. Возвращает True, когда остановка завершена."""
-        if not hasattr(self, '_inertia_end_time'):
-            self._inertia_end_time = time.time() + 0.4
-            self._set_speed(0, -FORWARD_SPEED * 0.5, 0, 0)  # vy — назад
+        self.drone.drone.go_to_local_point(x, y, 2, 0)
+        self.target_point_sent = True
+        self.command_sent_time = time.time()
+        self.point_reached_time = 0.0
+        self.current_target_pos = (x, y)
+        print(f"[Mission] Отправлена команда: лететь в ({x:.2f}, {y:.2f}), "
+              f"расстояние: {distance:.2f}м, ожидаемое время: {self.expected_flight_time:.2f}с")
+
+    def _has_reached_point(self):
+        """Проверка достижения точки через ожидаемое время полёта."""
+        if not self.target_point_sent:
             return False
-        
-        if time.time() >= self._inertia_end_time:
-            self._stop()
-            del self._inertia_end_time
-            return True
-            
-        self._set_speed(0, -FORWARD_SPEED * 0.5, 0, 0)
-        return False
-
-    def _find_pair(self, markers):
-        m4 = [m for m in markers if m['type'] == '4x4' and m['coords'] is not None]
-        m5 = [m for m in markers if m['type'] == '5x5' and m['coords'] is not None]
-        if m4 and m5:
-            for marker4 in m4:
-                for marker5 in m5:
-                    if not any(r['id_4x4'] == marker4['id'] for r in self.collected):
-                        return marker4, marker5
-        return None, None
+        return time.time() - self.command_sent_time >= self.expected_flight_time
 
     def _handle_waiting(self):
         if time.time() - self.state_start_time > 2.0:
-            print("[Mission] Начинаем прямой поиск первой пары...")
-            self.state = self.STATE_SEARCH_FIRST
-            self.state_start_time = time.time()
-            self._set_speed(0, FORWARD_SPEED, 0, 0)
+            print("[Mission] Летим в точку (0, 0)...")
+            self.state = self.STATE_GO_TO_ORIGIN
+            self.current_target_pos = (0.0, 0.0)
+            self._send_point(0, 0)
 
-    def _handle_search_first(self, markers):
-        m4, m5 = self._find_pair(markers)
-        if m4 and m5:
-            print(f"[Mission] Найдена первая пара! 4x4={m4['id']}, 5x5={m5['id']}")
-            self.found_4x4 = m4
-            self.found_5x5 = m5
-            self.target_marker_id = m4['id']
-            # Гасим инерцию неблокирующе
-            if self._check_inertia_stop():
-                self.state = self.STATE_APPROACHING
-                self.state_start_time = time.time()
+    def _handle_go_to_origin(self):
+        if self._has_reached_point():
+            print("[Mission] Прибыли в (0, 0). Начинаем калибровку...")
+            self.state = self.STATE_CALIBRATION
+            self.calibration_start_time = time.time()
+            self._send_point(0, self.CALIBRATION_DISTANCE)
+
+    def _handle_calibration(self):
+        if self._has_reached_point():
+            self.calibration_time = time.time() - self.calibration_start_time
+            self.effective_speed = self.CALIBRATION_DISTANCE / self.calibration_time
+            print(f"[Mission] Калибровка завершена. Время полёта {self.CALIBRATION_DISTANCE}м: "
+                  f"{self.calibration_time:.2f}с, скорость: {self.effective_speed:.2f} м/с")
+            self.state = self.STATE_RETURN_TO_ORIGIN
+            self._send_point(0, 0)
+
+    def _handle_return_to_origin(self):
+        if self._has_reached_point():
+            print("[Mission] Вернулись в (0, 0). Начинаем сканирование первого квадрата...")
+            self.current_square = (0, 0)
+            self._generate_spiral_points(self.current_square)
+            self.state = self.STATE_SCAN_SQUARE
+            self.current_spiral_idx = 0
+            self.target_point_sent = False
+
+    def _generate_spiral_points(self, square_offset):
+        """Генерирует точки спирали для конкретного квадрата.
+        square_offset = (x_off, y_off) — смещение левого нижнего угла.
+        Спираль идёт от центра квадрата к краям, обязательно проходя через все 4 угла."""
+        x_off, y_off = square_offset
+        center = (x_off + self.SQUARE_SIZE / 2, y_off + self.SQUARE_SIZE / 2)
+        
+        self.spiral_points = []
+        self.spiral_points.append(center)
+
+        step = self.SPIRAL_STEP
+        num_rings = int((self.SQUARE_SIZE / 2.0) / step)
+
+        for ring in range(1, num_rings + 1):
+            radius = ring * step
+            x_min = x_off
+            x_max = x_off + self.SQUARE_SIZE
+            y_min = y_off
+            y_max = y_off + self.SQUARE_SIZE
+
+            # Ограничиваем рамкой текущего кольца
+            x_min_ring = max(x_min, center[0] - radius)
+            x_max_ring = min(x_max, center[0] + radius)
+            y_min_ring = max(y_min, center[1] - radius)
+            y_max_ring = min(y_max, center[1] + radius)
+
+            # Верхняя сторона (слева направо)
+            for x in np.arange(x_min_ring, x_max_ring + step / 2, step):
+                self.spiral_points.append((round(x, 2), y_max_ring))
+            # Правая сторона (сверху вниз)
+            for y in np.arange(y_max_ring - step, y_min_ring - step / 2, -step):
+                self.spiral_points.append((x_max_ring, round(y, 2)))
+            # Нижняя сторона (справа налево)
+            for x in np.arange(x_max_ring - step, x_min_ring - step / 2, -step):
+                self.spiral_points.append((round(x, 2), y_min_ring))
+            # Левая сторона (снизу вверх)
+            for y in np.arange(y_min_ring + step, y_max_ring - step / 2, step):
+                self.spiral_points.append((x_min_ring, round(y, 2)))
+
+        # Убираем дубликаты
+        unique_points = []
+        seen = set()
+        for point in self.spiral_points:
+            rounded = (round(point[0], 2), round(point[1], 2))
+            if rounded not in seen:
+                seen.add(rounded)
+                unique_points.append(point)
+        self.spiral_points = unique_points
+
+        # Гарантируем наличие углов текущего квадрата
+        corners = [
+            (x_off, y_off),
+            (x_off, y_off + self.SQUARE_SIZE),
+            (x_off + self.SQUARE_SIZE, y_off),
+            (x_off + self.SQUARE_SIZE, y_off + self.SQUARE_SIZE)
+        ]
+        for corner in corners:
+            rounded_corner = (round(corner[0], 2), round(corner[1], 2))
+            if rounded_corner not in seen:
+                self.spiral_points.append(corner)
+
+        print(f"[Mission] Квадрат {square_offset}: сгенерировано {len(self.spiral_points)} точек спирали")
+
+    def _handle_scan_square(self, markers: List[Dict]):
+        """Сканирует текущий квадрат по спирали."""
+        if not self.target_point_sent:
+            if self.current_spiral_idx >= len(self.spiral_points):
+                print(f"[Mission] Квадрат {self.current_square} просканирован.")
+                self.state = self.STATE_DECIDE_NEXT
+                return
+
+            x, y = self.spiral_points[self.current_spiral_idx]
+            print(f"[Mission] Квадрат {self.current_square}: летим к точке ({x:.2f}, {y:.2f}) "
+                  f"[{self.current_spiral_idx}/{len(self.spiral_points)}]")
+            self._send_point(x, y)
             return
-            
-        self._set_speed(0, FORWARD_SPEED, 0, 0)
 
-    def _handle_approaching(self, markers):
-        target = None
-        for m in markers:
-            if m['type'] == '4x4' and m['id'] == self.target_marker_id and m['coords'] is not None:
-                target = m
-                break
+        if self._has_reached_point():
+            if self.point_reached_time == 0:
+                self.point_reached_time = time.time()
+
+            if time.time() - self.point_reached_time >= 1.0:
+                self.current_spiral_idx += 1
+                self.target_point_sent = False
+                self.point_reached_time = 0
+
+        self._check_and_record_markers(markers)
+
+    def _handle_decide_next(self):
+        """Решает, куда лететь дальше."""
+        # Проверяем, нашли ли мы что-то в текущем квадрате
+        found_in_current = any(
+            self._is_in_square(entry['pos'], self.current_square)
+            for entry in self.collected
+        )
+        
+        if found_in_current:
+            self.last_square_with_markers = self.current_square
+            if self.current_square not in self.squares_with_markers:
+                self.squares_with_markers.append(self.current_square)
+            print(f"[Mission] В квадрате {self.current_square} найдены метки! "
+                  f"Продолжаем в направлении '{self.direction}'.")
+
+            # Продолжаем в том же направлении
+            if self.direction == "forward":
+                self.current_square = (self.current_square[0], self.current_square[1] + 1)
+            else:  # side
+                self.current_square = (self.current_square[0] + 1, self.current_square[1])
+        else:
+            # Не нашли меток в текущем квадрате
+            print(f"[Mission] В квадрате {self.current_square} меток не найдено.")
+            
+            if self.direction == "forward":
+                # Возвращаемся на последний квадрат с метками и переключаемся на "side"
+                if self.last_square_with_markers == self.current_square:
+                    # Мы ещё не нашли ни одного квадрата с метками — возвращаемся домой
+                    print("[Mission] Меток не найдено ни в одном квадрате. Возвращаемся в (0, 0).")
+                    self.state = self.STATE_RETURN_HOME
+                    self._send_point(0, 0)
+                    return
                 
-        if target is None:
-            if time.time() - self.state_start_time > 3.0:
-                print("[Mission] Маркер потерян при подлёте, переход к записи.")
-                if self._check_inertia_stop():
-                    self.state = self.STATE_RECORDING
-            else:
-                self._stop()
-            return
-
-        coords = target['coords']
-        target_distance = 0.8
-        kp_xy = 0.4
-        kp_z = 0.5
-        
-        err_x = coords[0]
-        err_y = coords[1]
-        err_z = coords[2] - target_distance
-        
-        # ИСПРАВЛЕНИЕ 1: Добавляем мёртвые зоны, чтобы дрон не "ёлся" и не улетал назад
-        if abs(err_z) < 0.05:
-            vy = 0.0
-        else:
-            vy = kp_z * err_z
-            
-        if abs(err_x) < 0.03:
-            vx = 0.0
-        else:
-            vx = -kp_xy * err_x
-        
-        vx = np.clip(vx, -FORWARD_SPEED, FORWARD_SPEED)
-        vy = np.clip(vy, -FORWARD_SPEED, FORWARD_SPEED)
-        
-        self._set_speed(vx, vy, 0, 0)
-        
-        # ИСПРАВЛЕНИЕ 2: Гасим инерцию перед переходом в RECORD
-        if abs(err_x) < 0.05 and abs(err_y) < 0.05 and abs(err_z) < 0.1:
-            if self._check_inertia_stop():
-                print("[Mission] Подлёт завершён и инерция погашена!")
-                self.state = self.STATE_RECORDING
-                self.state_start_time = time.time()
-
-    def _handle_recording(self, markers):
-        entry = {
-            "id_4x4": self.found_4x4['id'],
-            "id_5x5": self.found_5x5['id'],
-            "pos": [round(self.x, 2), round(self.y, 2)]
-        }
-        self.collected.append(entry)
-        self.map_data.append(entry)
-
-        with open("map.json", "w") as f:
-            json.dump(self.map_data, f, indent=2)
-
-        print(f"[Mission] Записана пара #{len(self.collected)}: {entry}")
-        
-        self.anchor_pos = (self.x, self.y)
-
-        if len(self.collected) == 1:
-            self.state = self.STATE_MEASURE_GAP
-            print("[Mission] Ищем вторую пару для измерения gap...")
-        elif len(self.collected) >= self.target_groups:
-            print("[Mission] Все пары собраны! Возвращаемся домой.")
-            self.state = self.STATE_RETURN_HOME
-        else:
-            self.state = self.STATE_NAVIGATE
-            self.distance_to_fly = self.gap_distance * 1.5
-            print(f"[Mission] Летим на {self.distance_to_fly:.2f} м...")
-            
-        self.state_start_time = time.time()
-        self._set_speed(0, FORWARD_SPEED, 0, 0)
-
-    def _handle_measure_gap(self, markers):
-        m4, m5 = self._find_pair(markers)
-        if m4 and m5:
-            dist = math.hypot(self.x - self.anchor_pos[0], self.y - self.anchor_pos[1])
-            self.gap_distance = dist
-            print(f"[Mission] Измерен gap: {self.gap_distance:.2f} м")
-            
-            self.found_4x4 = m4
-            self.found_5x5 = m5
-            self.target_marker_id = m4['id']
-            
-            if self._check_inertia_stop():
-                self.state = self.STATE_APPROACHING
-                self.state_start_time = time.time()
-            return
-            
-        self._set_speed(0, FORWARD_SPEED, 0, 0)
-
-    def _handle_navigate(self, markers):
-        m4, m5 = self._find_pair(markers)
-        if m4 and m5:
-            print(f"[Mission] Найдена пара в навигации! 4x4={m4['id']}, 5x5={m5['id']}")
-            self.found_4x4 = m4
-            self.found_5x5 = m5
-            self.target_marker_id = m4['id']
-            if self._check_inertia_stop():
-                self.state = self.STATE_APPROACHING
-                self.state_start_time = time.time()
-            return
-
-        dist_traveled = math.hypot(self.x - self.anchor_pos[0], self.y - self.anchor_pos[1])
-        if dist_traveled >= self.distance_to_fly:
-            print("[Mission] Пролетели gap*1.5, пара не найдена. Возвращаемся.")
-            if self._check_inertia_stop():
-                self.state = self.STATE_RETURN_TO_LAST
-                self.state_start_time = time.time()
-            return
-            
-        self._set_speed(0, FORWARD_SPEED, 0, 0)
-
-    def _handle_return_to_last(self):
-        target_x, target_y = self.anchor_pos
-        dx = target_x - self.x
-        dy = target_y - self.y
-        dist = math.hypot(dx, dy)
-
-        # ИСПРАВЛЕНИЕ 3: Убран бесконечный цикл. Используем неблокирующий _check_inertia_stop
-        if dist < 0.15:
-            if self._check_inertia_stop():
-                print("[Mission] Остановились на последней точке. Поворачиваем на 90°.")
-                self.state = self.STATE_TURN_90
-                self.state_start_time = time.time()
-                self.rotation_attempts += 1
-            return
-
-        desired_yaw = math.atan2(dx, dy)
-        yaw_err = (desired_yaw - self.yaw + math.pi) % (2 * math.pi) - math.pi
-
-        if abs(yaw_err) > 0.15:
-            yaw_rate = np.clip(yaw_err * 1.5, -YAW_SPEED, YAW_SPEED)
-            self._set_speed(0, 0, 0, yaw_rate)
-        else:
-            self._set_speed(0, FORWARD_SPEED, 0, 0)
-
-    def _handle_turn_90(self):
-        if not hasattr(self, '_turn_target_yaw'):
-            # ИСПРАВЛЕНИЕ 4: Добавляем +0.1 рад (~5.7°) для компенсации недоворота
-            self._turn_target_yaw = self.yaw + math.pi / 2 + 0.1
-            
-        yaw_err = (self._turn_target_yaw - self.yaw + math.pi) % (2 * math.pi) - math.pi
-        
-        # Ужесточаем допуск с 0.15 до 0.05 и увеличиваем коэффициент
-        if abs(yaw_err) > 0.05:
-            yaw_rate = np.clip(yaw_err * 2.5, -YAW_SPEED, YAW_SPEED)
-            self._set_speed(0, 0, 0, yaw_rate)
-        else:
-            self._stop()
-            del self._turn_target_yaw
-            
-            if self.rotation_attempts >= 4:
-                print("[Mission] Все направления проверены. Возвращаемся домой.")
+                print(f"[Mission] Возвращаемся на квадрат {self.last_square_with_markers} "
+                      f"и переключаемся на боковой поиск.")
+                self.current_square = (self.last_square_with_markers[0] + 1, 
+                                      self.last_square_with_markers[1])
+                self.direction = "side"
+            else:  # direction == "side"
+                # Боковой поиск тоже не дал результатов — возвращаемся домой
+                print("[Mission] Боковой поиск не дал результатов. Возвращаемся в (0, 0).")
                 self.state = self.STATE_RETURN_HOME
-            else:
-                print(f"[Mission] Летим в новом направлении (попытка {self.rotation_attempts}).")
-                self.state = self.STATE_NAVIGATE
-                self.distance_to_fly = self.gap_distance * 1.5
-                self.anchor_pos = (self.x, self.y)
-                
-            self.state_start_time = time.time()
+                self._send_point(0, 0)
+                return
+        
+        print(f"[Mission] Переходим к квадрату {self.current_square}")
+        self.state = self.STATE_MOVE_TO_SQUARE
+
+    def _is_in_square(self, pos, square_offset):
+        """Проверяет, находится ли позиция внутри квадрата."""
+        x_off, y_off = square_offset
+        x, y = pos[0], pos[1]
+        return (x_off <= x <= x_off + self.SQUARE_SIZE and 
+                y_off <= y <= y_off + self.SQUARE_SIZE)
+
+    def _handle_move_to_square(self):
+        """Летит в центр нового квадрата и начинает сканирование."""
+        if not self.target_point_sent:
+            x_off, y_off = self.current_square
+            center_x = x_off + self.SQUARE_SIZE / 2
+            center_y = y_off + self.SQUARE_SIZE / 2
+            print(f"[Mission] Летим в центр квадрата {self.current_square}: ({center_x:.2f}, {center_y:.2f})")
+            self._send_point(center_x, center_y)
+            return
+
+        if self._has_reached_point():
+            print(f"[Mission] Прибыли в квадрат {self.current_square}. Начинаем сканирование.")
+            self._generate_spiral_points(self.current_square)
+            self.state = self.STATE_SCAN_SQUARE
+            self.current_spiral_idx = 0
+            self.target_point_sent = False
 
     def _handle_return_home(self):
-        target_x, target_y = 0.0, 0.0
-        dx = target_x - self.x
-        dy = target_y - self.y
-        dist = math.hypot(dx, dy)
-        
-        if dist < 0.2:
-            if self._check_inertia_stop():
-                print("[Mission] Вернулись на точку старта (0,0). Завершаем.")
-                self.state = self.STATE_DONE
-            return
-            
-        desired_yaw = math.atan2(dx, dy)
-        yaw_err = (desired_yaw - self.yaw + math.pi) % (2 * math.pi) - math.pi
-        
-        if abs(yaw_err) > 0.15:
-            yaw_rate = np.clip(yaw_err * 1.5, -YAW_SPEED, YAW_SPEED)
-            self._set_speed(0, 0, 0, yaw_rate)
-        else:
-            self._set_speed(0, FORWARD_SPEED, 0, 0)
+        """Возврат в (0, 0) и завершение."""
+        if self._has_reached_point():
+            print(f"[Mission] Вернулись в (0, 0). Миссия завершена. "
+                  f"Просканировано квадратов с метками: {len(self.squares_with_markers)}")
+            self.state = self.STATE_DONE
+
+    def _check_and_record_markers(self, markers: List[Dict]):
+        m4 = [m for m in markers if m['type'] == '4x4' and m['coords'] is not None]
+        m5 = [m for m in markers if m['type'] == '5x5' and m['coords'] is not None]
+
+        if m4 and m5:
+            for marker4 in m4:
+                for marker5 in m5:
+                    pair_id = (marker4['id'], marker5['id'])
+                    if pair_id not in self.recorded_pairs:
+                        entry = {
+                            'id_4x4': marker4['id'],
+                            'id_5x5': marker5['id'],
+                            'marker_coords_4x4': marker4['coords'],
+                            'marker_coords_5x5': marker5['coords'],
+                            'pos': list(self.current_target_pos)
+                        }
+                        self.collected.append(entry)
+                        self.map_data.append(entry)
+                        self.recorded_pairs.add(pair_id)
+
+                        with open("map.json", "w") as f:
+                            json.dump(self.map_data, f, indent=2)
+
+                        print(f"[Mission] Записана пара: 4x4={marker4['id']}, 5x5={marker5['id']} "
+                              f"на позиции {self.current_target_pos}")
+                        return
 
     def get_results(self) -> List[Dict]:
         return self.collected

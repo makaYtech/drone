@@ -68,7 +68,7 @@ def main():
                 results = mission.get_results()
                 print("Собрано групп: ", len(results))
                 for i, r in enumerate(results, 1):
-                    print(f"  {i}: 4x4 ID={r['id_4x4']}, 5x5 ID={r['id_5x5']}, pos={r['pos']}")
+                    print(f"  {i}: 4x4 ID={r['id_4x4']}, 5x5 ID={r['id_5x5']}, pos={r['drone_pos']}")
                 drone.land()
                 time.sleep(2)
                 break
