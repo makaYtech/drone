@@ -1,0 +1,10 @@
+class MissionStates:
+    WAITING = "waiting"
+    GO_TO_ORIGIN = "go_to_origin"
+    CALIBRATION = "calibration"
+    RETURN_TO_ORIGIN = "return_to_origin"
+    SCAN_SQUARE = "scan_square"
+    DECIDE_NEXT = "decide_next"
+    MOVE_TO_SQUARE = "move_to_square"
+    RETURN_HOME = "return_home"
+    DONE = "done"

@@ -11,12 +11,9 @@ class Mission:
         self.collected = []
         self.map_data = []
 
-        # Размер одного квадрата и шаг спирали
-        self.SQUARE_SIZE = 1.0
-        self.SPIRAL_STEP = 0.1  # шаг спирали внутри квадрата
-        
-        # Калибровка
-        self.CALIBRATION_DISTANCE = 10.0  # эталонное расстояние для калибровки
+        self.SQUARE_SIZE = 10.0
+        self.SPIRAL_STEP = 1.0
+        self.CALIBRATION_DISTANCE = 10.0
 
         # Состояния
         self.STATE_WAITING = "waiting"
@@ -32,28 +29,21 @@ class Mission:
         self.state = self.STATE_WAITING
         self.state_start_time = time.time()
 
-        # Калибровка
-        self.calibration_time = 0.0
-        self.calibration_start_time = 0.0
-        self.effective_speed = 0.0
-
-        # Спираль
         self.spiral_points = []
         self.current_spiral_idx = 0
         self.recorded_pairs = set()
 
-        # Управление полётом по точкам
         self.target_point_sent = False
         self.command_sent_time = 0.0
         self.point_reached_time = 0.0
         self.current_target_pos = (0.0, 0.0)
-        self.expected_flight_time = 0.0
+        self.point_was_reached = False
 
-        # Логика обхода квадратов
-        self.current_square = (0, 0)  # (x_offset, y_offset) — смещение левого нижнего угла
+        self.current_square = (0, 0)
         self.last_square_with_markers = (0, 0)
-        self.direction = "forward"  # "forward" — наращиваем Y, "side" — наращиваем X
-        self.squares_with_markers = []  # список квадратов, где нашли метки
+        self.direction = "forward"
+        self.squares_with_markers = []
+        self.has_been_backward = False
 
     def start(self):
         self.state = self.STATE_WAITING
@@ -77,62 +67,49 @@ class Mission:
         elif self.state == self.STATE_DECIDE_NEXT:
             self._handle_decide_next()
         elif self.state == self.STATE_MOVE_TO_SQUARE:
-            self._handle_move_to_square()
+            self._handle_move_to_square(markers)
         elif self.state == self.STATE_RETURN_HOME:
             self._handle_return_home()
 
         return self.state
 
     def _send_point(self, x, y):
-        """Отправляет команду на полёт и вычисляет ожидаемое время."""
-        current_x, current_y = self.current_target_pos
-        distance = math.sqrt((x - current_x)**2 + (y - current_y)**2)
-
-        if self.effective_speed > 0:
-            self.expected_flight_time = distance / self.effective_speed + 1.0
-        else:
-            self.expected_flight_time = 5.0
-
         self.drone.drone.go_to_local_point(x, y, 2, 0)
         self.target_point_sent = True
         self.command_sent_time = time.time()
         self.point_reached_time = 0.0
+        self.point_was_reached = False
         self.current_target_pos = (x, y)
-        print(f"[Mission] Отправлена команда: лететь в ({x:.2f}, {y:.2f}), "
-              f"расстояние: {distance:.2f}м, ожидаемое время: {self.expected_flight_time:.2f}с")
+        print(f"[Mission] Команда: лететь в ({x:.2f}, {y:.2f})")
 
     def _has_reached_point(self):
-        """Проверка достижения точки через ожидаемое время полёта."""
         if not self.target_point_sent:
             return False
-        return time.time() - self.command_sent_time >= self.expected_flight_time
+        if time.time() - self.command_sent_time < 2.0:
+            return False
+        return self.drone.drone.point_reached()
 
     def _handle_waiting(self):
         if time.time() - self.state_start_time > 2.0:
-            print("[Mission] Летим в точку (0, 0)...")
+            print("[Mission] Летим в (0, 0)...")
             self.state = self.STATE_GO_TO_ORIGIN
-            self.current_target_pos = (0.0, 0.0)
             self._send_point(0, 0)
 
     def _handle_go_to_origin(self):
         if self._has_reached_point():
             print("[Mission] Прибыли в (0, 0). Начинаем калибровку...")
             self.state = self.STATE_CALIBRATION
-            self.calibration_start_time = time.time()
             self._send_point(0, self.CALIBRATION_DISTANCE)
 
     def _handle_calibration(self):
         if self._has_reached_point():
-            self.calibration_time = time.time() - self.calibration_start_time
-            self.effective_speed = self.CALIBRATION_DISTANCE / self.calibration_time
-            print(f"[Mission] Калибровка завершена. Время полёта {self.CALIBRATION_DISTANCE}м: "
-                  f"{self.calibration_time:.2f}с, скорость: {self.effective_speed:.2f} м/с")
+            print(f"[Mission] Прибыли в (0, {self.CALIBRATION_DISTANCE}). Возвращаемся...")
             self.state = self.STATE_RETURN_TO_ORIGIN
             self._send_point(0, 0)
 
     def _handle_return_to_origin(self):
         if self._has_reached_point():
-            print("[Mission] Вернулись в (0, 0). Начинаем сканирование первого квадрата...")
+            print("[Mission] Вернулись в (0, 0). Начинаем сканирование...")
             self.current_square = (0, 0)
             self._generate_spiral_points(self.current_square)
             self.state = self.STATE_SCAN_SQUARE
@@ -140,171 +117,275 @@ class Mission:
             self.target_point_sent = False
 
     def _generate_spiral_points(self, square_offset):
-        """Генерирует точки спирали для конкретного квадрата.
-        square_offset = (x_off, y_off) — смещение левого нижнего угла.
-        Спираль идёт от центра квадрата к краям, обязательно проходя через все 4 угла."""
+        """Генерирует НЕПРЕРЫВНУЮ спираль от центра к краям.
+        Каждое кольцо начинается там, где закончилось предыдущее.
+        Все переходы строго по одной оси (без диагоналей)."""
         x_off, y_off = square_offset
-        center = (x_off + self.SQUARE_SIZE / 2, y_off + self.SQUARE_SIZE / 2)
-        
-        self.spiral_points = []
-        self.spiral_points.append(center)
-
+        cx = x_off + self.SQUARE_SIZE / 2
+        cy = y_off + self.SQUARE_SIZE / 2
         step = self.SPIRAL_STEP
         num_rings = int((self.SQUARE_SIZE / 2.0) / step)
 
+        points = [(round(cx, 2), round(cy, 2))]
+
         for ring in range(1, num_rings + 1):
-            radius = ring * step
-            x_min = x_off
-            x_max = x_off + self.SQUARE_SIZE
-            y_min = y_off
-            y_max = y_off + self.SQUARE_SIZE
+            x_min = round(max(x_off, cx - ring * step), 2)
+            x_max = round(min(x_off + self.SQUARE_SIZE, cx + ring * step), 2)
+            y_min = round(max(y_off, cy - ring * step), 2)
+            y_max = round(min(y_off + self.SQUARE_SIZE, cy + ring * step), 2)
 
-            # Ограничиваем рамкой текущего кольца
-            x_min_ring = max(x_min, center[0] - radius)
-            x_max_ring = min(x_max, center[0] + radius)
-            y_min_ring = max(y_min, center[1] - radius)
-            y_max_ring = min(y_max, center[1] + radius)
+            last_x, last_y = points[-1]
 
-            # Верхняя сторона (слева направо)
-            for x in np.arange(x_min_ring, x_max_ring + step / 2, step):
-                self.spiral_points.append((round(x, 2), y_max_ring))
-            # Правая сторона (сверху вниз)
-            for y in np.arange(y_max_ring - step, y_min_ring - step / 2, -step):
-                self.spiral_points.append((x_max_ring, round(y, 2)))
-            # Нижняя сторона (справа налево)
-            for x in np.arange(x_max_ring - step, x_min_ring - step / 2, -step):
-                self.spiral_points.append((round(x, 2), y_min_ring))
-            # Левая сторона (снизу вверх)
-            for y in np.arange(y_min_ring + step, y_max_ring - step / 2, step):
-                self.spiral_points.append((x_min_ring, round(y, 2)))
+            # Переход: вверх до y_max нового кольца
+            while last_y < y_max - 0.01:
+                last_y = round(min(last_y + step, y_max), 2)
+                points.append((last_x, last_y))
 
-        # Убираем дубликаты
-        unique_points = []
+            # Переход: влево до x_min нового кольца
+            while last_x > x_min + 0.01:
+                last_x = round(max(last_x - step, x_min), 2)
+                points.append((last_x, last_y))
+
+            # Теперь мы в (x_min, y_max) — верхний-левый угол кольца
+
+            # Вправо по верхней стороне
+            while last_x < x_max - 0.01:
+                last_x = round(min(last_x + step, x_max), 2)
+                points.append((last_x, last_y))
+
+            # Вниз по правой стороне
+            while last_y > y_min + 0.01:
+                last_y = round(max(last_y - step, y_min), 2)
+                points.append((last_x, last_y))
+
+            # Влево по нижней стороне
+            while last_x > x_min + 0.01:
+                last_x = round(max(last_x - step, x_min), 2)
+                points.append((last_x, last_y))
+
+            # Вверх по левой стороне (не доходя до y_max, чтобы не замкнуть)
+            target_y = round(y_max - step, 2) if ring < num_rings else y_max
+            while last_y < target_y - 0.01:
+                last_y = round(min(last_y + step, target_y), 2)
+                points.append((last_x, last_y))
+
+        # Убираем дубликаты, сохраняя порядок
+        unique = []
         seen = set()
-        for point in self.spiral_points:
-            rounded = (round(point[0], 2), round(point[1], 2))
-            if rounded not in seen:
-                seen.add(rounded)
-                unique_points.append(point)
-        self.spiral_points = unique_points
+        for p in points:
+            r = (round(p[0], 2), round(p[1], 2))
+            if r not in seen:
+                seen.add(r)
+                unique.append(r)
 
-        # Гарантируем наличие углов текущего квадрата
+        # Гарантируем наличие углов квадрата
         corners = [
-            (x_off, y_off),
-            (x_off, y_off + self.SQUARE_SIZE),
-            (x_off + self.SQUARE_SIZE, y_off),
-            (x_off + self.SQUARE_SIZE, y_off + self.SQUARE_SIZE)
+            (round(x_off, 2), round(y_off, 2)),
+            (round(x_off, 2), round(y_off + self.SQUARE_SIZE, 2)),
+            (round(x_off + self.SQUARE_SIZE, 2), round(y_off, 2)),
+            (round(x_off + self.SQUARE_SIZE, 2), round(y_off + self.SQUARE_SIZE, 2))
         ]
-        for corner in corners:
-            rounded_corner = (round(corner[0], 2), round(corner[1], 2))
-            if rounded_corner not in seen:
-                self.spiral_points.append(corner)
+        for c in corners:
+            if c not in seen:
+                unique.append(c)
 
-        print(f"[Mission] Квадрат {square_offset}: сгенерировано {len(self.spiral_points)} точек спирали")
+        self.spiral_points = unique
+        print(f"[Mission] Квадрат {square_offset}: {len(self.spiral_points)} точек")
+
+    def _find_straight_line_end(self, start_idx):
+        """Если 3+ точек идут строго по одной оси в одном направлении —
+        возвращает индекс последней. Иначе возвращает start_idx."""
+        if start_idx >= len(self.spiral_points) - 2:
+            return start_idx
+
+        p0 = self.spiral_points[start_idx]
+        p1 = self.spiral_points[start_idx + 1]
+
+        dx = round(p1[0] - p0[0], 2)
+        dy = round(p1[1] - p0[1], 2)
+
+        # Определяем ось движения
+        if abs(dx) > 0.01 and abs(dy) < 0.01:
+            axis = 'x'
+            sign = 1 if dx > 0 else -1
+        elif abs(dy) > 0.01 and abs(dx) < 0.01:
+            axis = 'y'
+            sign = 1 if dy > 0 else -1
+        else:
+            return start_idx  # Диагональ — не оптимизируем
+
+        # Ищем конец прямой
+        end_idx = start_idx + 1
+        for i in range(start_idx + 2, len(self.spiral_points)):
+            curr = self.spiral_points[i]
+            prev = self.spiral_points[i - 1]
+
+            d_x = round(curr[0] - prev[0], 2)
+            d_y = round(curr[1] - prev[1], 2)
+
+            if axis == 'x':
+                # Должно быть движение ТОЛЬКО по X в том же направлении
+                if abs(d_y) > 0.01 or (d_x * sign) < 0.01:
+                    break
+            else:
+                # Должно быть движение ТОЛЬКО по Y в том же направлении
+                if abs(d_x) > 0.01 or (d_y * sign) < 0.01:
+                    break
+
+            end_idx = i
+
+        # Оптимизируем только если 3+ точек в цепочке (включая стартовую)
+        if end_idx - start_idx + 1 >= 3:
+            return end_idx
+        else:
+            return start_idx
 
     def _handle_scan_square(self, markers: List[Dict]):
-        """Сканирует текущий квадрат по спирали."""
         if not self.target_point_sent:
             if self.current_spiral_idx >= len(self.spiral_points):
                 print(f"[Mission] Квадрат {self.current_square} просканирован.")
                 self.state = self.STATE_DECIDE_NEXT
                 return
 
-            x, y = self.spiral_points[self.current_spiral_idx]
-            print(f"[Mission] Квадрат {self.current_square}: летим к точке ({x:.2f}, {y:.2f}) "
-                  f"[{self.current_spiral_idx}/{len(self.spiral_points)}]")
-            self._send_point(x, y)
+            line_end = self._find_straight_line_end(self.current_spiral_idx)
+
+            if line_end > self.current_spiral_idx:
+                target = self.spiral_points[line_end]
+                print(f"[Mission] Прямая: {self.current_spiral_idx} → {line_end} "
+                      f"к ({target[0]:.2f}, {target[1]:.2f})")
+                self._send_point(target[0], target[1])
+                self._target_spiral_idx = line_end
+            else:
+                x, y = self.spiral_points[self.current_spiral_idx]
+                print(f"[Mission] Спираль: точка ({x:.2f}, {y:.2f}) "
+                      f"[{self.current_spiral_idx}/{len(self.spiral_points)}]")
+                self._send_point(x, y)
+                self._target_spiral_idx = self.current_spiral_idx
             return
 
-        if self._has_reached_point():
-            if self.point_reached_time == 0:
-                self.point_reached_time = time.time()
+        # Сканируем метки во время полёта
+        self._check_and_record_markers(markers)
 
+        if self._has_reached_point():
+            if not self.point_was_reached:
+                self.point_was_reached = True
+                self.point_reached_time = time.time()
+                print(f"[Mission] Достигли точки {self.current_target_pos}")
+
+        if self.point_was_reached:
             if time.time() - self.point_reached_time >= 1.0:
+                if hasattr(self, '_target_spiral_idx'):
+                    self.current_spiral_idx = self._target_spiral_idx
+                    del self._target_spiral_idx
+
                 self.current_spiral_idx += 1
                 self.target_point_sent = False
                 self.point_reached_time = 0
-
-        self._check_and_record_markers(markers)
+                self.point_was_reached = False
 
     def _handle_decide_next(self):
-        """Решает, куда лететь дальше."""
-        # Проверяем, нашли ли мы что-то в текущем квадрате
         found_in_current = any(
             self._is_in_square(entry['pos'], self.current_square)
             for entry in self.collected
         )
-        
+
         if found_in_current:
             self.last_square_with_markers = self.current_square
             if self.current_square not in self.squares_with_markers:
                 self.squares_with_markers.append(self.current_square)
             print(f"[Mission] В квадрате {self.current_square} найдены метки! "
-                  f"Продолжаем в направлении '{self.direction}'.")
+                  f"Продолжаем '{self.direction}'.")
 
-            # Продолжаем в том же направлении
             if self.direction == "forward":
-                self.current_square = (self.current_square[0], self.current_square[1] + 1)
-            else:  # side
-                self.current_square = (self.current_square[0] + 1, self.current_square[1])
+                next_sq = (self.current_square[0], self.current_square[1] + self.SQUARE_SIZE)
+            elif self.direction == "backward":
+                next_sq = (self.current_square[0], self.current_square[1] - self.SQUARE_SIZE)
+            else:
+                next_sq = (self.current_square[0] + self.SQUARE_SIZE, self.current_square[1])
+
+            self.current_square = next_sq
+            self.state = self.STATE_MOVE_TO_SQUARE
         else:
-            # Не нашли меток в текущем квадрате
-            print(f"[Mission] В квадрате {self.current_square} меток не найдено.")
-            
+            print(f"[Mission] В квадрате {self.current_square} меток нет.")
+
             if self.direction == "forward":
-                # Возвращаемся на последний квадрат с метками и переключаемся на "side"
-                if self.last_square_with_markers == self.current_square:
-                    # Мы ещё не нашли ни одного квадрата с метками — возвращаемся домой
-                    print("[Mission] Меток не найдено ни в одном квадрате. Возвращаемся в (0, 0).")
+                if len(self.squares_with_markers) == 0:
+                    print("[Mission] Вперёд ничего. Пробуем назад.")
+                    self.current_square = (0, -int(self.SQUARE_SIZE))
+                    self.direction = "backward"
+                    self.has_been_backward = True
+                    self.state = self.STATE_MOVE_TO_SQUARE
+                else:
+                    print(f"[Mission] Возврат на {self.last_square_with_markers}, бок.")
+                    self.current_square = (
+                        self.last_square_with_markers[0] + int(self.SQUARE_SIZE),
+                        self.last_square_with_markers[1])
+                    self.direction = "side"
+                    self.state = self.STATE_MOVE_TO_SQUARE
+            elif self.direction == "backward":
+                print(f"[Mission] Возврат на {self.last_square_with_markers}, бок.")
+                self.current_square = (
+                    self.last_square_with_markers[0] + int(self.SQUARE_SIZE),
+                    self.last_square_with_markers[1])
+                self.direction = "side"
+                self.state = self.STATE_MOVE_TO_SQUARE
+            else:
+                if not self.has_been_backward:
+                    print("[Mission] Бок не дал. Возврат в (0,0), назад.")
                     self.state = self.STATE_RETURN_HOME
                     self._send_point(0, 0)
-                    return
-                
-                print(f"[Mission] Возвращаемся на квадрат {self.last_square_with_markers} "
-                      f"и переключаемся на боковой поиск.")
-                self.current_square = (self.last_square_with_markers[0] + 1, 
-                                      self.last_square_with_markers[1])
-                self.direction = "side"
-            else:  # direction == "side"
-                # Боковой поиск тоже не дал результатов — возвращаемся домой
-                print("[Mission] Боковой поиск не дал результатов. Возвращаемся в (0, 0).")
-                self.state = self.STATE_RETURN_HOME
-                self._send_point(0, 0)
-                return
-        
-        print(f"[Mission] Переходим к квадрату {self.current_square}")
-        self.state = self.STATE_MOVE_TO_SQUARE
+                    self._after_return_action = "backward"
+                else:
+                    print("[Mission] Всё проверено. Возврат в (0, 0).")
+                    self.state = self.STATE_RETURN_HOME
+                    self._send_point(0, 0)
+                    self._after_return_action = "done"
 
     def _is_in_square(self, pos, square_offset):
-        """Проверяет, находится ли позиция внутри квадрата."""
         x_off, y_off = square_offset
         x, y = pos[0], pos[1]
-        return (x_off <= x <= x_off + self.SQUARE_SIZE and 
+        return (x_off <= x <= x_off + self.SQUARE_SIZE and
                 y_off <= y <= y_off + self.SQUARE_SIZE)
 
-    def _handle_move_to_square(self):
-        """Летит в центр нового квадрата и начинает сканирование."""
+    def _handle_move_to_square(self, markers: List[Dict]):
         if not self.target_point_sent:
             x_off, y_off = self.current_square
             center_x = x_off + self.SQUARE_SIZE / 2
             center_y = y_off + self.SQUARE_SIZE / 2
-            print(f"[Mission] Летим в центр квадрата {self.current_square}: ({center_x:.2f}, {center_y:.2f})")
+            print(f"[Mission] Летим в квадрат {self.current_square}: "
+                  f"({center_x:.2f}, {center_y:.2f})")
             self._send_point(center_x, center_y)
             return
 
+        # Сканируем по пути
+        self._check_and_record_markers(markers)
+
         if self._has_reached_point():
-            print(f"[Mission] Прибыли в квадрат {self.current_square}. Начинаем сканирование.")
+            print(f"[Mission] Прибыли в квадрат {self.current_square}. "
+                  f"Спиральное сканирование.")
             self._generate_spiral_points(self.current_square)
             self.state = self.STATE_SCAN_SQUARE
             self.current_spiral_idx = 0
             self.target_point_sent = False
 
     def _handle_return_home(self):
-        """Возврат в (0, 0) и завершение."""
         if self._has_reached_point():
-            print(f"[Mission] Вернулись в (0, 0). Миссия завершена. "
-                  f"Просканировано квадратов с метками: {len(self.squares_with_markers)}")
-            self.state = self.STATE_DONE
+            action = getattr(self, '_after_return_action', 'done')
+
+            if action == "backward":
+                print("[Mission] Вернулись в (0, 0). Движение назад.")
+                self.current_square = (0, -int(self.SQUARE_SIZE))
+                self.direction = "backward"
+                self.has_been_backward = True
+                self._generate_spiral_points(self.current_square)
+                self.state = self.STATE_SCAN_SQUARE
+                self.current_spiral_idx = 0
+                self.target_point_sent = False
+                self._after_return_action = None
+            else:
+                print(f"[Mission] Миссия завершена. "
+                      f"Квадратов с метками: {len(self.squares_with_markers)}")
+                self.state = self.STATE_DONE
 
     def _check_and_record_markers(self, markers: List[Dict]):
         m4 = [m for m in markers if m['type'] == '4x4' and m['coords'] is not None]
@@ -329,8 +410,8 @@ class Mission:
                         with open("map.json", "w") as f:
                             json.dump(self.map_data, f, indent=2)
 
-                        print(f"[Mission] Записана пара: 4x4={marker4['id']}, 5x5={marker5['id']} "
-                              f"на позиции {self.current_target_pos}")
+                        print(f"[Mission] Записана пара: 4x4={marker4['id']}, "
+                              f"5x5={marker5['id']} на {self.current_target_pos}")
                         return
 
     def get_results(self) -> List[Dict]:
