@@ -1,7 +1,8 @@
 from pioneer_sdk import Pioneer
 import time
 import numpy as np
-from config import DIST_FAR, DIST_NEAR, FORWARD_SPEED, YAW_SPEED
+from config import FORWARD_SPEED
+from control.flight_logger import FlightLogger
 
 class DroneGlobalController:
     def __init__(self, ip, port, simulator=True):
@@ -12,36 +13,41 @@ class DroneGlobalController:
         
         self.inertia_compensating = False
         self.inertia_end_time = 0.0
+        
+        # Инициализация логгера
+        self.logger = FlightLogger("flight_log.csv")
 
-    # ---OUTSIDE/ ---
     def go_to_point(self, x, y, z, yaw=0.0):
-        """Отправляет дрон в локальную точку."""
         self.drone.go_to_local_point(x, y, z, yaw)
+        self.logger.log_goto(x, y, z, yaw)
 
     def point_reached(self):
-        """Проверяет, достиг ли дрон точки."""
         return self.drone.point_reached()
-    # ---------------------------------
 
     def arm(self):
         if not self.armed:
             self.drone.arm()
             self.armed = True
+            self.logger.log_event("ARM", "Дрон armed")
 
     def takeoff(self, altitude=5.0):
         if not self.in_air:
             self.drone.takeoff()
             self.in_air = True
+            self.logger.log_event("TAKEOFF", f"Высота {altitude}")
             time.sleep(2)
 
     def land(self):
         if self.in_air:
+            self.logger.log_event("LAND", "Команда на посадку")
             self.drone.land()
             self.drone.disarm()
             self.in_air = False
+            self.logger.close()
 
     def set_manual_speed(self, vx=0, vy=0, vz=0, yaw_rate=0):
         self.drone.set_manual_speed_body_fixed(vx, vy, vz, yaw_rate)
+        self.logger.log_speed(vx, vy, vz, yaw_rate)
 
     def hold_position(self):
         now = time.time()
