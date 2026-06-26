@@ -1,19 +1,22 @@
 import time
 from typing import List, Dict
-
+from constants import (
+    SQUARE_SIZE, DEFAULT_ALTITUDE, CALIBRATION_DISTANCE,
+    WAIT_BEFORE_START, TIMEOUT_POINT_REACHED
+)
 from outside.states import MissionStates
 from outside.marker_handler import MarkerHandler
 from outside.navigation import Navigator
 from outside.path_planner import PathPlanner
 
-
 class Mission:
-    def __init__(self, drone_controller, initial_yaw: float = 0, target_groups: int = 4, default_altitude: float = 1.7):
+    def __init__(self, drone_controller, initial_yaw: float = 0, target_groups: int = 4,
+                 default_altitude: float = DEFAULT_ALTITUDE):
         self.drone = drone_controller
         self.target_groups = target_groups
         self.default_altitude = default_altitude
-        self.CALIBRATION_DISTANCE = 10.0
-        self.SQUARE_SIZE = 10.0
+        self.CALIBRATION_DISTANCE = CALIBRATION_DISTANCE
+        self.SQUARE_SIZE = SQUARE_SIZE
 
         self.state = MissionStates.WAITING
         self.state_start_time = time.time()
@@ -32,13 +35,13 @@ class Mission:
         self.has_been_backward = False
         self._after_return_action = None
 
-        # Переменные для вычисления позиции маркера
+        # Для калибровки
         self.calibration_time = None
         self.movement_speed = None
         self.straight_start_time = None
         self.straight_start_pos = (0.0, 0.0)
-        self.straight_axis = None       # 'x' или 'y'
-        self.straight_direction = 1     # 1 или -1
+        self.straight_axis = None
+        self.straight_direction = 1
 
     def start(self):
         self.state = MissionStates.WAITING
@@ -69,7 +72,7 @@ class Mission:
         return self.state
 
     def _handle_waiting(self):
-        if time.time() - self.state_start_time > 2.0:
+        if time.time() - self.state_start_time > WAIT_BEFORE_START:
             print("[Mission] Летим в (0, 0)...")
             self.state = MissionStates.GO_TO_ORIGIN
             self.navigator.send_point(0, 0, z=self.default_altitude)
@@ -89,7 +92,7 @@ class Mission:
                 print(f"[Mission] Скорость движения: {self.movement_speed:.3f} м/с (время {elapsed:.2f} сек)")
             else:
                 self.movement_speed = 0.5
-            print(f"[Mission] Прибыли в (0, {self.CALIBRATION_DISTANCE}). Возвращаемся...")
+            print("[Mission] Возвращаемся в (0,0)...")
             self.state = MissionStates.RETURN_TO_ORIGIN
             self.navigator.send_point(0, 0, z=self.default_altitude)
 
@@ -136,6 +139,7 @@ class Mission:
                 self.straight_axis = None
             return
 
+        # Определяем позицию для записи маркеров
         if self.straight_axis is not None and self.movement_speed is not None:
             elapsed = time.time() - self.straight_start_time
             distance = elapsed * self.movement_speed
@@ -159,7 +163,6 @@ class Mission:
                 if hasattr(self, '_target_spiral_idx'):
                     self.current_spiral_idx = self._target_spiral_idx
                     del self._target_spiral_idx
-
                 self.current_spiral_idx += 1
                 self.navigator.reset_target()
                 self.straight_axis = None
@@ -167,7 +170,7 @@ class Mission:
     def _handle_decide_next(self):
         found_in_current = any(
             self.marker_handler.is_in_square(entry['pos'], self.current_square)
-            for entry in self.marker_handler.collected
+            for entry in self.marker_handler.map_data
         )
 
         if found_in_current:
@@ -180,7 +183,7 @@ class Mission:
                 next_sq = (self.current_square[0], self.current_square[1] + self.SQUARE_SIZE)
             elif self.direction == "backward":
                 next_sq = (self.current_square[0], self.current_square[1] - self.SQUARE_SIZE)
-            else:
+            else:  # side
                 next_sq = (self.current_square[0] + self.SQUARE_SIZE, self.current_square[1])
 
             self.current_square = next_sq
@@ -209,7 +212,7 @@ class Mission:
                     self.last_square_with_markers[1])
                 self.direction = "side"
                 self.state = MissionStates.MOVE_TO_SQUARE
-            else:
+            else:  # side
                 if not self.has_been_backward:
                     print("[Mission] Бок не дал. Возврат в (0,0), назад.")
                     self.state = MissionStates.RETURN_HOME
@@ -242,7 +245,6 @@ class Mission:
     def _handle_return_home(self):
         if self.navigator.has_reached_point():
             action = getattr(self, '_after_return_action', 'done')
-
             if action == "backward":
                 print("[Mission] Вернулись в (0, 0). Движение назад.")
                 self.current_square = (0, -int(self.SQUARE_SIZE))

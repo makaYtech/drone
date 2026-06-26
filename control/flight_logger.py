@@ -7,7 +7,7 @@ class FlightLogger:
         self.file = open(self.filename, mode='w', newline='', encoding='utf-8')
         self.writer = csv.writer(self.file)
         self.writer.writerow([
-            'time_sec', 'event_type', 
+            'time_sec', 'event_type',
             'cmd_x', 'cmd_y', 'cmd_z', 'cmd_yaw',
             'cmd_vx', 'cmd_vy', 'cmd_vz', 'cmd_yaw_rate',
             'tel_x', 'tel_y', 'tel_z', 'tel_yaw',

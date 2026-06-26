@@ -1,13 +1,12 @@
 import json
 import math
-from typing import List, Dict, Tuple
+from typing import List, Dict, Tuple, Optional
 
 class MarkerHandler:
     def __init__(self, map_file: str = "map.json", square_size: float = 10.0):
         self.map_file = map_file
         self.square_size = square_size
-        self.map_data = []          # основное хранилище
-        self.collected = self.map_data  # для обратной совместимости
+        self.map_data = []
         self.recorded_pairs = set()
         self.recorded_singles = set()
         self.last_recorded_pos = {}
@@ -19,7 +18,6 @@ class MarkerHandler:
                 data = json.load(f)
                 if isinstance(data, list):
                     self.map_data = data
-                    self.collected = self.map_data
                     for entry in data:
                         if entry.get('type') == 'pair':
                             self.recorded_pairs.add((entry['id_4x4'], entry['id_5x5']))
@@ -28,6 +26,9 @@ class MarkerHandler:
                         pos = entry.get('pos')
                         if pos and len(pos) >= 2:
                             self.last_recorded_pos[entry['id_4x4']] = (pos[0], pos[1])
+                        # Добавляем is_centered, если отсутствует
+                        if 'is_centered' not in entry:
+                            entry['is_centered'] = False
         except FileNotFoundError:
             pass
         except Exception as e:
@@ -54,21 +55,30 @@ class MarkerHandler:
             if new_dist >= old_dist:
                 return False
 
+            if entry.get('type') == 'single' and old_entry.get('type') == 'pair':
+                entry['id_5x5'] = old_entry.get('id_5x5')
+                entry['marker_coords_5x5'] = old_entry.get('marker_coords_5x5')
+                entry['type'] = 'pair'
+
             if old_entry.get('type') == 'pair':
                 self.recorded_pairs.discard((old_entry['id_4x4'], old_entry['id_5x5']))
             elif old_entry.get('type') == 'single':
                 self.recorded_singles.discard(old_entry['id_4x4'])
 
-            self.map_data[idx] = entry
+            # Сохраняем старый is_centered, если не передан новый
+            if 'is_centered' not in entry:
+                entry['is_centered'] = old_entry.get('is_centered', False)
 
+            self.map_data[idx] = entry
             if entry.get('type') == 'pair':
                 self.recorded_pairs.add((entry['id_4x4'], entry['id_5x5']))
             elif entry.get('type') == 'single':
                 self.recorded_singles.add(entry['id_4x4'])
-
             self.last_recorded_pos[entry['id_4x4']] = tuple(entry['pos'])
             return True
         else:
+            if 'is_centered' not in entry:
+                entry['is_centered'] = False
             self.map_data.append(entry)
             if entry.get('type') == 'pair':
                 self.recorded_pairs.add((entry['id_4x4'], entry['id_5x5']))
@@ -77,52 +87,70 @@ class MarkerHandler:
             self.last_recorded_pos[entry['id_4x4']] = tuple(entry['pos'])
             return True
 
-    def check_and_record_markers(self, markers: List[Dict], marker_position: Tuple[float, float]):
-        """
-        Сохраняет маркеры с указанной позицией marker_position (вычисленной реальной координатой).
-        """
-        m4 = [m for m in markers if m['type'] == '4x4' and m['coords'] is not None]
-        m5 = [m for m in markers if m['type'] == '5x5' and m['coords'] is not None]
+    def check_and_record_markers(self, markers: List[Dict], marker_position: Tuple[float, float],
+                                  target_id_4x4: Optional[int] = None, is_centered: bool = False):
+        """Записывает или обновляет запись для конкретного id_4x4, с возможностью установить флаг is_centered."""
+        m4_all = [m for m in markers if m['type'] == '4x4' and m['coords'] is not None]
+        m5_all = [m for m in markers if m['type'] == '5x5' and m['coords'] is not None]
 
-        if m4 and m5:
-            for marker4 in m4:
-                for marker5 in m5:
-                    if marker4['id'] == marker5['id']:
-                        entry = {
-                            'type': 'pair',
-                            'id_4x4': marker4['id'],
-                            'id_5x5': marker5['id'],
-                            'marker_coords_4x4': marker4['coords'],
-                            'marker_coords_5x5': marker5['coords'],
-                            'pos': list(marker_position),
-                            'distance_to_marker': marker4['coords'][2]
-                        }
-                        updated = self._update_or_add_entry(entry)
-                        if updated:
-                            self._save_map()
-                            print(f"[MarkerHandler] Записана/обновлена пара: 4x4={marker4['id']}, 5x5={marker5['id']} на {marker_position}")
-                        return
+        if target_id_4x4 is not None:
+            m4 = [m for m in m4_all if int(m['id']) == target_id_4x4]
+            if not m4:
+                return
+        else:
+            m4 = m4_all
 
-        # Одиночные 4x4
+        if m4 and m5_all:
+            marker4 = m4[0]
+            marker5 = m5_all[0]
+            entry = {
+                'type': 'pair',
+                'id_4x4': marker4['id'],
+                'id_5x5': marker5['id'],
+                'marker_coords_4x4': marker4['coords'],
+                'marker_coords_5x5': marker5['coords'],
+                'pos': list(marker_position),
+                'distance_to_marker': marker4['coords'][2],
+                'is_centered': is_centered
+            }
+            if self._update_or_add_entry(entry):
+                self._save_map()
+                print(f"[MarkerHandler] Обновлена пара: 4x4={marker4['id']}, 5x5={marker5['id']} на {marker_position} (is_centered={is_centered})")
+            return
+
         for marker4 in m4:
             idx = self._find_entry_by_id(marker4['id'])
-            if idx is not None and self.map_data[idx].get('type') == 'pair':
-                continue
-
-            entry = {
-                'type': 'single',
-                'id_4x4': marker4['id'],
-                'id_5x5': None,
-                'marker_coords_4x4': marker4['coords'],
-                'marker_coords_5x5': None,
-                'pos': list(marker_position),
-                'distance_to_marker': marker4['coords'][2]
-            }
-            updated = self._update_or_add_entry(entry)
-            if updated:
-                self._save_map()
-                print(f"[MarkerHandler] Записана/обновлена одиночная 4x4 ID={marker4['id']} на {marker_position}")
-            return
+            if idx is not None:
+                old_entry = self.map_data[idx]
+                entry = {
+                    'type': old_entry.get('type', 'single'),
+                    'id_4x4': marker4['id'],
+                    'id_5x5': old_entry.get('id_5x5'),
+                    'marker_coords_4x4': marker4['coords'],
+                    'marker_coords_5x5': old_entry.get('marker_coords_5x5'),
+                    'pos': list(marker_position),
+                    'distance_to_marker': marker4['coords'][2],
+                    'is_centered': is_centered
+                }
+                if self._update_or_add_entry(entry):
+                    self._save_map()
+                    print(f"[MarkerHandler] Обновлена запись для 4x4={marker4['id']} на {marker_position} (is_centered={is_centered})")
+                return
+            else:
+                entry = {
+                    'type': 'single',
+                    'id_4x4': marker4['id'],
+                    'id_5x5': None,
+                    'marker_coords_4x4': marker4['coords'],
+                    'marker_coords_5x5': None,
+                    'pos': list(marker_position),
+                    'distance_to_marker': marker4['coords'][2],
+                    'is_centered': is_centered
+                }
+                if self._update_or_add_entry(entry):
+                    self._save_map()
+                    print(f"[MarkerHandler] Записана новая одиночная 4x4 ID={marker4['id']} на {marker_position} (is_centered={is_centered})")
+                return
 
     def is_in_square(self, pos: Tuple[float, float], square_offset: Tuple[float, float]) -> bool:
         x_off, y_off = square_offset
@@ -132,3 +160,13 @@ class MarkerHandler:
 
     def get_results(self) -> List[Dict]:
         return self.map_data
+
+    def mark_as_centered(self, id_4x4: int):
+        """Устанавливает флаг is_centered = True для записи с данным id_4x4."""
+        idx = self._find_entry_by_id(id_4x4)
+        if idx is not None:
+            self.map_data[idx]['is_centered'] = True
+            self._save_map()
+            print(f"[MarkerHandler] Цель {id_4x4} отмечена как центрированная.")
+            return True
+        return False

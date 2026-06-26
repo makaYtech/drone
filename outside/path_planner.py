@@ -1,20 +1,24 @@
+from constants import SQUARE_SIZE, SPIRAL_STEP
+
 class PathPlanner:
-    def __init__(self, square_size: float = 10.0, spiral_step: float = 1.0):
+    def __init__(self, square_size: float = SQUARE_SIZE, spiral_step: float = SPIRAL_STEP):
         self.SQUARE_SIZE = square_size
         self.SPIRAL_STEP = spiral_step
         self.spiral_points = []
 
     def generate_spiral_points(self, square_offset: tuple):
-        """Генерирует НЕПРЕРЫВНУЮ спираль от центра к краям."""
+        """Генерирует непрерывную спираль от центра квадрата к краям."""
         x_off, y_off = square_offset
         cx = x_off + self.SQUARE_SIZE / 2
         cy = y_off + self.SQUARE_SIZE / 2
         step = self.SPIRAL_STEP
-        num_rings = int((self.SQUARE_SIZE / 2.0) / step)
+        half = self.SQUARE_SIZE / 2
+        num_rings = int(half / step)
 
         points = [(round(cx, 2), round(cy, 2))]
 
         for ring in range(1, num_rings + 1):
+            # Границы текущего кольца
             x_min = round(max(x_off, cx - ring * step), 2)
             x_max = round(min(x_off + self.SQUARE_SIZE, cx + ring * step), 2)
             y_min = round(max(y_off, cy - ring * step), 2)
@@ -22,31 +26,27 @@ class PathPlanner:
 
             last_x, last_y = points[-1]
 
+            # Движение по часовой стрелке: вверх, влево, вниз, вправо, вверх...
             while last_y < y_max - 0.01:
                 last_y = round(min(last_y + step, y_max), 2)
                 points.append((last_x, last_y))
-
             while last_x > x_min + 0.01:
                 last_x = round(max(last_x - step, x_min), 2)
                 points.append((last_x, last_y))
-
             while last_x < x_max - 0.01:
                 last_x = round(min(last_x + step, x_max), 2)
                 points.append((last_x, last_y))
-
             while last_y > y_min + 0.01:
                 last_y = round(max(last_y - step, y_min), 2)
                 points.append((last_x, last_y))
+            # Доводим до начальной точки следующего кольца (если не последнее)
+            if ring < num_rings:
+                target_y = round(y_max - step, 2)
+                while last_y < target_y - 0.01:
+                    last_y = round(min(last_y + step, target_y), 2)
+                    points.append((last_x, last_y))
 
-            while last_x > x_min + 0.01:
-                last_x = round(max(last_x - step, x_min), 2)
-                points.append((last_x, last_y))
-
-            target_y = round(y_max - step, 2) if ring < num_rings else y_max
-            while last_y < target_y - 0.01:
-                last_y = round(min(last_y + step, target_y), 2)
-                points.append((last_x, last_y))
-
+        # Удаление дубликатов
         unique = []
         seen = set()
         for p in points:
@@ -55,6 +55,7 @@ class PathPlanner:
                 seen.add(r)
                 unique.append(r)
 
+        # Добавляем углы, если их нет
         corners = [
             (round(x_off, 2), round(y_off, 2)),
             (round(x_off, 2), round(y_off + self.SQUARE_SIZE, 2)),
@@ -92,7 +93,6 @@ class PathPlanner:
         for i in range(start_idx + 2, len(self.spiral_points)):
             curr = self.spiral_points[i]
             prev = self.spiral_points[i - 1]
-
             d_x = round(curr[0] - prev[0], 2)
             d_y = round(curr[1] - prev[1], 2)
 
@@ -102,7 +102,6 @@ class PathPlanner:
             else:
                 if abs(d_x) > 0.01 or (d_y * sign) < 0.01:
                     break
-
             end_idx = i
 
         return end_idx if (end_idx - start_idx + 1) >= 3 else start_idx

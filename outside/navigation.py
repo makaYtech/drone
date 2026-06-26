@@ -1,10 +1,10 @@
 import time
+import math
+from constants import TIMEOUT_POINT_REACHED
 
 class Navigator:
     def __init__(self, drone_controller):
-        # drone_controller - это экземпляр DroneGlobalController
-        self.drone = drone_controller 
-        
+        self.drone = drone_controller
         self.target_point_sent = False
         self.command_sent_time = 0.0
         self.point_reached_time = 0.0
@@ -12,9 +12,7 @@ class Navigator:
         self.point_was_reached = False
 
     def send_point(self, x: float, y: float, z: float = 2.0, yaw: float = 0.0):
-        # Используем новый метод-обертку из drone_global_control.py
         self.drone.go_to_point(x, y, z, yaw)
-        
         self.target_point_sent = True
         self.command_sent_time = time.time()
         self.point_reached_time = 0.0
@@ -25,9 +23,9 @@ class Navigator:
     def has_reached_point(self) -> bool:
         if not self.target_point_sent:
             return False
-        if time.time() - self.command_sent_time < 2.0:
+        if time.time() - self.command_sent_time < TIMEOUT_POINT_REACHED:
             return False
-        # Используем новый метод-обертку
+        # Используем метод дрона для проверки достижения
         return self.drone.point_reached()
 
     def mark_reached(self):

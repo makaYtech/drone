@@ -3,83 +3,20 @@ import os
 import cv2
 import time
 import logging
-import json
 import numpy as np
 
 from config import IP, PORT, PORT_CAM
+from constants import DEFAULT_ALTITUDE, WAIT_BEFORE_START
 from camera.camera_utils import CameraManager
 from camera.aruco.detector import ArUcoDetector
 from control.drone_global_control import DroneGlobalController
+from utils import generate_report_from_map
 
-# ===== Декодер =====
-INDEX_TO_PLANT = {
-    0: "Томаты",
-    1: "Огурцы",
-    2: "Базилик"
-}
+# Настройка логирования
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
-def decode(code):
-    """
-    Декодирует число (0..248) в тип растения и количество.
-    Возвращает (название_растения, количество) или (None, сообщение_об_ошибке).
-    """
-    if not (0 <= code <= 248):
-        return None, "Код вне допустимого диапазона"
-    idx = code // 83
-    offset = code % 83
-    if idx not in INDEX_TO_PLANT:
-        return None, "Неверный индекс типа"
-    quantity = offset + 8
-    return INDEX_TO_PLANT[idx], quantity
-
-def generate_report_from_map(map_file="map.json", output_file="report.txt"):
-    """Читает map.json, декодирует пары и записывает отчёт."""
-    if not os.path.exists(map_file):
-        print(f"[Report] Файл {map_file} не найден.")
-        return
-
-    try:
-        with open(map_file, 'r') as f:
-            data = json.load(f)
-    except Exception as e:
-        print(f"[Report] Ошибка чтения {map_file}: {e}")
-        return
-
-    if not data:
-        print("[Report] Нет данных для отчёта.")
-        return
-
-    lines = []
-    lines.append("=== Отчёт по обнаруженным парам маркеров ===")
-    lines.append("Тип растения | Количество | Координаты (x, y)")
-
-    for entry in data:
-        # Пропускаем одиночные маркеры, если они есть
-        if entry.get('type') == 'single':
-            continue
-
-        id_4x4 = entry.get('id_4x4')
-        id_5x5 = entry.get('id_5x5')
-        pos = entry.get('pos', [0, 0])
-        x, y = pos[0], pos[1]
-
-        # Декодируем ID второго маркера (5x5)
-        plant, quantity = decode(id_5x5)
-        if plant is None:
-            lines.append(f"ОШИБКА: ID 5x5={id_5x5} не декодируется: {quantity}")
-            continue
-
-        # Выводим без проверки соответствия, просто по декодированным данным
-        lines.append(f"{plant:12} | {quantity:10} | ({x:.2f}, {y:.2f})")
-
-    lines.append("=== Конец отчёта ===")
-
-    with open(output_file, 'w', encoding='utf-8') as f:
-        f.write('\n'.join(lines))
-
-    print(f"[Report] Отчёт сохранён в {output_file}")
-
-# ===== Фильтр вывода (оставляем как есть) =====
+# Фильтр для подавления сообщений MANUAL_SPEED в stdout
 class FilterOutManualSpeed:
     def __init__(self, stream):
         self.stream = stream
@@ -99,35 +36,41 @@ class FilterOutManualSpeed:
 sys.stdout = FilterOutManualSpeed(sys.stdout)
 logging.getLogger('pioneer_sdk').setLevel(logging.WARNING)
 
+def select_mission(drone, map_file="map.json"):
+    """Выбирает режим миссии в зависимости от наличия map.json."""
+    if os.path.exists(map_file) and os.path.getsize(map_file) > 2:
+        logger.info("Обнаружен существующий %s. Запуск режима INSERT.", map_file)
+        from outside.insert import InsertMission
+        from outside.marker_handler import MarkerHandler
+        marker_handler = MarkerHandler(map_file, square_size=10.0)
+        return InsertMission(drone, marker_handler, frame_w=640, frame_h=480)
+    else:
+        logger.info("%s не найден или пуст. Запуск режима EXPLORATION.", map_file)
+        from outside import Mission
+        return Mission(drone, initial_yaw=0.0, target_groups=4, default_altitude=DEFAULT_ALTITUDE)
+
+
 def main():
-    TARGET_GROUPS = 4
     MAP_FILE = "map.json"
-    
+
     # 1. Инициализация
-    print("[Main] Инициализация компонентов...")
+    logger.info("Инициализация компонентов...")
     cam_mgr = CameraManager(IP, PORT_CAM)
     detector = ArUcoDetector()
     drone = DroneGlobalController(IP, PORT, simulator=True)
-    
-# 2. ВЫБОР РЕЖИМА
-    if os.path.exists(MAP_FILE) and os.path.getsize(MAP_FILE) > 2:
-        print(f"[Main] Обнаружен существующий {MAP_FILE}. Запуск режима INSERT.")
-        from outside.insert import InsertMission
-        mission = InsertMission(drone, map_file=MAP_FILE, frame_w=640, frame_h=480)
-    else:
-        print(f"[Main] {MAP_FILE} не найден или пуст. Запуск режима EXPLORATION (поиск).")
-        from outside import Mission
-        mission = Mission(drone, initial_yaw=0.0, target_groups=TARGET_GROUPS, default_altitude=1.7)   # <-- здесь высота 1.7
 
-    # ... (дальше)
-    # 3. Предполетная подготовка
+    # 2. Выбор миссии
+    mission = select_mission(drone, MAP_FILE)
+
+    # 3. Предполётная подготовка
     drone.arm()
     drone.takeoff()
-    print("[Main] Дрон взлетел, запускаем миссию...")
+    logger.info("Дрон взлетел, запускаем миссию...")
     mission.start()
-    
+
+    # Если миссия разведки – развернуть дрон на 180° (опционально)
     if type(mission).__name__ == 'Mission':
-        drone.go_to_point(0, 0, 1.7, np.radians(180))
+        drone.go_to_point(0, 0, DEFAULT_ALTITUDE, np.radians(180))
 
     # 4. Главный цикл
     try:
@@ -141,34 +84,33 @@ def main():
             status = mission.update(markers)
 
             if status == 'done':
-                print("\n[Main] Миссия завершена, выполняем посадку...")
+                logger.info("Миссия завершена, выполняем посадку...")
                 if hasattr(mission, 'get_results'):
                     results = mission.get_results()
-                    print(f"[Main] Собрано групп: {len(results)}")
-                
-                # Генерируем отчёт по карте
+                    logger.info("Собрано групп: %d", len(results))
+
                 generate_report_from_map(MAP_FILE, "report.txt")
-                
                 drone.land()
                 time.sleep(2)
                 break
 
             cv2.imshow("ArUco Detection", vis_frame)
             if cv2.waitKey(1) & 0xFF == ord('q'):
-                print("\n[Main] Принудительная остановка по нажатию 'q'")
+                logger.info("Принудительная остановка по нажатию 'q'")
                 drone.land()
                 break
 
     except KeyboardInterrupt:
-        print("\n[Main] Остановка по Ctrl+C")
+        logger.info("Остановка по Ctrl+C")
         drone.land()
     except Exception as e:
-        print(f"\n[Main] Критическая ошибка: {e}")
+        logger.error("Критическая ошибка: %s", e, exc_info=True)
         drone.land()
     finally:
         cv2.destroyAllWindows()
         cam_mgr.release()
-        print("[Main] Программа завершена.")
+        logger.info("Программа завершена.")
+
 
 if __name__ == "__main__":
     main()
