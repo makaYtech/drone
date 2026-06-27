@@ -1,17 +1,15 @@
 import time
-import random
 from enum import Enum
 
 from constants import (
     TIMEOUT_SEARCH, TIMEOUT_DESCEND, TIMEOUT_MARKER_LOST,
     TIMEOUT_MARKER_LOST_MOVEMENT,
-    MIN_CENTERING_STEP, MAX_CENTERING_STEP,
-    CENTERING_TOLERANCE_X, CENTERING_TOLERANCE_Y,
     CENTERING_PAUSE_BEFORE, CENTERING_PAUSE_AFTER,
     CENTERING_MAX_ATTEMPTS, CENTERING_DESCENT_ALTITUDE,
     DEFAULT_ALTITUDE, STABILIZE_TIME, HEIGHT_STEP,
-    REQUIRED_STABLE_FRAMES
+    DESCENT_TIMEOUT
 )
+from outside.centering_controller import CenteringController
 
 class InsertState(Enum):
     INIT = 0
@@ -42,38 +40,26 @@ class InsertMission:
         self.targets = []
         self.current_target_idx = 0
 
-        self.target_point_sent = False
-        self.command_sent_time = 0.0
-
         self.current_x = 0.0
         self.current_y = 0.0
         self.current_z = DEFAULT_ALTITUDE
 
-        self.anchor_x = 0.0
-        self.anchor_y = 0.0
-        self.anchor_z = DEFAULT_ALTITUDE
+        self.centering_start_x = 0.0
+        self.centering_start_y = 0.0
 
-        self.marker_was_seen = False
-        self._msg_printed = False
+        self._move_sent = False
+        self._target_reached = False
+        self._target_reached_time = 0.0
+        self._command_sent_time = 0.0
 
         self.centering_start_time = 0.0
-        self.best_direction = (0.0, 0.0)
-        self.attempts = 0
-        self.consecutive_good = 0
-        self.stable_frames = 0
-        self.last_marker_pos = None
-        self.current_move_direction = (0.0, 0.0)
-
-        self.bad_directions = []
-        self.last_good_direction = (0.0, 0.0)
-        self.good_directions_history = []
-
+        self.search_start_time = 0.0
         self.waiting_start_time = 0.0
         self.lost_during_movement = False
+        self.descent_timeout = DESCENT_TIMEOUT
+        self._msg_printed = False
 
-        self._point_reached_checked = False
-
-        # Параметры мигания светодиодами
+        # Мигание зелёным (только для первой цели)
         self._blink_active = False
         self._blink_start_time = 0.0
         self._blink_phase = 0
@@ -81,10 +67,13 @@ class InsertMission:
         self._blink_count = 0
         self._blink_duration = 0.5
 
+        self.centering = CenteringController(frame_w, frame_h)
+
     def start(self):
         self.state = InsertState.INIT
-        print("[Insert] Миссия запущена (с оптимизированным выбором направления и отладкой).")
+        print("[Insert] Миссия запущена (оптимизированная версия).")
 
+    # ---- Вспомогательные методы ----
     def _load_targets(self):
         self.targets = self.marker_handler.map_data[:]
         print(f"[Insert] Загружено {len(self.targets)} целей.")
@@ -110,7 +99,12 @@ class InsertMission:
 
     def _update_current_target_position(self, is_centered=True):
         if self.current_target_idx < len(self.targets):
-            x, y = self.current_x, self.current_y
+            pos = self.drone.get_position()
+            if pos is not None:
+                x, y, z = pos
+                self.current_x, self.current_y, self.current_z = x, y, z
+            else:
+                x, y = self.current_x, self.current_y
             self.targets[self.current_target_idx]['pos'] = [x, y]
             self.targets[self.current_target_idx]['is_centered'] = is_centered
             for entry in self.marker_handler.map_data:
@@ -122,29 +116,25 @@ class InsertMission:
             print(f"[Insert] Обновлены координаты цели: ({x:.2f}, {y:.2f}) is_centered={is_centered}")
 
     def _set_all_leds(self, r, g, b):
-        """Установить цвет для всех светодиодов через led_control из pioneer_sdk."""
         try:
             self.drone.drone.led_control(r=r, g=g, b=b)
         except AttributeError:
             pass
 
     def _blink_green(self):
-        """Обновляет состояние мигания зелёным светодиодом (вызывается каждый кадр)."""
+        """Обновляет состояние мигания зелёным (вызывается каждый кадр)."""
         if not self._blink_active:
             return
-
         now = time.time()
         if now - self._blink_phase_start >= self._blink_duration:
             self._blink_phase = 1 - self._blink_phase
             self._blink_phase_start = now
-
             if self._blink_phase == 0:
                 self._blink_count += 1
                 if self._blink_count >= 3:
                     self._set_all_leds(0, 0, 0)
                     self._blink_active = False
                     return
-
             if self._blink_phase == 1:
                 self._set_all_leds(0, 255, 0)
             else:
@@ -155,19 +145,29 @@ class InsertMission:
             z = self.current_z
         self.drone.set_manual_speed(0, 0, 0, 0)
         self.drone.go_to_point(x, y, z, yaw)
-        self.target_point_sent = True
-        self.command_sent_time = time.time()
+        self._move_sent = True
+        self._target_reached = False
+        self._target_reached_time = 0.0
+        self._command_sent_time = time.time()
         self.current_x = x
         self.current_y = y
         self.current_z = z
         print(f"[Insert] Летим в ({x:.2f}, {y:.2f}, {z:.2f})")
 
     def _has_reached_point(self):
-        if not self.target_point_sent:
-            return False
-        if time.time() - self.command_sent_time < 2.0:
-            return False
-        return self.drone.point_reached()
+        if self._target_reached:
+            return True
+        if self.drone.point_reached():
+            self._target_reached = True
+            self._target_reached_time = time.time()
+            print("[Insert] Точка достигнута (зафиксировано).")
+            return True
+        return False
+
+    def _is_stopped(self, threshold=0.05, duration=0.5):
+        if self._target_reached and time.time() - self._target_reached_time > 2.0:
+            return True
+        return self.drone.is_position_stable(threshold, duration)
 
     def _find_target_marker(self, markers, target_id_4x4):
         for m in markers:
@@ -175,46 +175,11 @@ class InsertMission:
                 return m
         return None
 
-    def _get_marker_center(self, marker):
-        if marker is None or 'center' not in marker:
-            return None
-        return marker['center']
-
-    def _is_marker_centered(self, marker):
-        if marker is None:
-            return False
-        mx, my = marker['center']
-        cx, cy = self.frame_w / 2, self.frame_h / 2
-        err_x = abs(mx - cx)
-        err_y = abs(my - cy)
-        if err_x < 100 and err_y < 100:
-            print(f"[DEBUG] _is_marker_centered: err_x={err_x:.1f}, err_y={err_y:.1f} -> {err_x < CENTERING_TOLERANCE_X and err_y < CENTERING_TOLERANCE_Y}")
-        return (err_x < CENTERING_TOLERANCE_X and err_y < CENTERING_TOLERANCE_Y)
-
-    def _get_marker_distance_to_center_from_pos(self, pos):
-        if pos is None:
-            return float('inf')
-        mx, my = pos
-        cx, cy = self.frame_w / 2, self.frame_h / 2
-        return ((mx - cx) ** 2 + (my - cy) ** 2) ** 0.5
-
-    def _get_centering_step(self, marker):
-        if marker is None:
-            return MIN_CENTERING_STEP
-        mx, my = marker['center']
-        cx, cy = self.frame_w / 2, self.frame_h / 2
-        dist = ((mx - cx) ** 2 + (my - cy) ** 2) ** 0.5
-        max_dist = ((self.frame_w/2) ** 2 + (self.frame_h/2) ** 2) ** 0.5
-        ratio = min(1.0, dist / max_dist)
-        step = MIN_CENTERING_STEP + (MAX_CENTERING_STEP - MIN_CENTERING_STEP) * ratio
-        return round(step, 2)
-
     def _decrease_height(self):
         new_z = max(CENTERING_DESCENT_ALTITUDE, self.current_z - HEIGHT_STEP)
         if new_z < self.current_z:
             print(f"[Insert] Плавное снижение: {self.current_z:.2f} -> {new_z:.2f} м")
             self.current_z = new_z
-            self.anchor_z = new_z
             self._send_point(self.current_x, self.current_y, z=self.current_z)
 
     def _is_target_already_centered(self):
@@ -222,34 +187,14 @@ class InsertMission:
             return self.targets[self.current_target_idx].get('is_centered', False)
         return False
 
-    def _choose_direction(self, step):
-        all_dirs = [
-            (step, 0), (-step, 0), (0, step), (0, -step),
-            (step, step), (step, -step), (-step, step), (-step, -step)
-        ]
-
-        if self.bad_directions:
-            candidates = [d for d in all_dirs if d not in self.bad_directions]
-            if not candidates:
-                print("[Insert] Все направления были плохими. Сбрасываю историю.")
-                self.bad_directions = []
-                candidates = all_dirs
-        else:
-            candidates = all_dirs
-
-        if self.last_good_direction != (0.0, 0.0):
-            opposite = (-self.last_good_direction[0], -self.last_good_direction[1])
-            if opposite in candidates and random.random() < 0.6:
-                print(f"[Insert] Выбираю противоположное направление {opposite} (на основе последнего успешного {self.last_good_direction})")
-                return opposite
-
-        chosen = random.choice(candidates)
-        print(f"[Insert] Выбираю случайное направление {chosen} из {len(candidates)} кандидатов")
-        return chosen
-
+    # ---- Основной цикл ----
     def update(self, markers):
-        # Обновляем состояние мигания (если активно) на каждом кадре
         self._blink_green()
+        self.drone.update_position_history()
+
+        pos = self.drone.get_position()
+        if pos is not None:
+            self.current_x, self.current_y, self.current_z = pos
 
         if self.state == InsertState.DONE:
             return "done"
@@ -269,7 +214,7 @@ class InsertMission:
 
             target = self.targets[self.current_target_idx]
 
-            if not self.target_point_sent:
+            if not self._move_sent:
                 if self._is_target_already_centered():
                     print(f"[Insert] Цель {self.current_target_idx+1} уже центрирована. Лечу на высоту 1.5 м.")
                     self._send_point(target['pos'][0], target['pos'][1], z=CENTERING_DESCENT_ALTITUDE)
@@ -277,51 +222,33 @@ class InsertMission:
                     self._send_point(target['pos'][0], target['pos'][1], z=DEFAULT_ALTITUDE)
                 return None
 
-            if time.time() - self.command_sent_time > 30.0:
-                print("[Insert] Таймаут достижения точки в FLY_TO_GLOBAL. Принудительно перехожу к стабилизации.")
-                self.target_point_sent = False
-                # Сохраняем текущие координаты как опорные для центрирования
-                self.anchor_x = self.current_x
-                self.anchor_y = self.current_y
-                self.anchor_z = self.current_z
+            if time.time() - self._command_sent_time > 30.0:
+                print("[Insert] Таймаут FLY_TO_GLOBAL. Перехожу к стабилизации.")
+                self._move_sent = False
                 self.state = InsertState.STABILIZE
                 self.centering_start_time = time.time()
                 return None
 
             if self._has_reached_point():
-                if self._is_target_already_centered():
-                    print(f"[Insert] Прибыли в точку {self.current_target_idx+1} (уже центрирована). Ожидание 10 сек.")
-                    self.state = InsertState.CENTERED_PAUSE
-                    self.centering_start_time = time.time()
-                    self._point_reached_checked = False   # сбрасываем для проверки
-                    self._msg_printed = False
-
-                    # Инициализируем мигание (только для первой цели)
-                    if self.current_target_idx == 0:
-                        self._blink_active = True
-                        self._blink_start_time = time.time()
-                        self._blink_phase = 0
-                        self._blink_phase_start = time.time()
-                        self._blink_count = 0
-                        self._set_all_leds(0, 255, 0)
-                        self._blink_phase = 1
-                    return None
-                else:
-                    print(f"[Insert] Прибыли в точку {self.current_target_idx+1}. Стабилизация {STABILIZE_TIME} сек.")
-                    self.target_point_sent = False
-                    self.anchor_x = self.current_x
-                    self.anchor_y = self.current_y
-                    self.anchor_z = self.current_z
-                    self.state = InsertState.STABILIZE
-                    self.centering_start_time = time.time()
+                self._move_sent = False
+                self.state = InsertState.STABILIZE
+                self.centering_start_time = time.time()
+                print("[Insert] Прибыли, стабилизация 2 сек.")
             return None
 
         elif self.state == InsertState.STABILIZE:
             if time.time() - self.centering_start_time < STABILIZE_TIME:
                 return None
-            print("[Insert] Стабилизация завершена. Начинаю поиск маркера.")
-            self.state = InsertState.SEARCHING
-            self.search_start_time = time.time()
+            print("[Insert] Стабилизация завершена.")
+            if self._is_target_already_centered():
+                self.state = InsertState.CENTERED_PAUSE
+                self.centering_start_time = time.time()
+                self._msg_printed = False
+                # Мигание будет активировано в CENTERED_PAUSE
+                return None
+            else:
+                self.state = InsertState.SEARCHING
+                self.search_start_time = time.time()
             return None
 
         elif self.state == InsertState.SEARCHING:
@@ -334,7 +261,7 @@ class InsertMission:
                         return None
                     else:
                         self.state = InsertState.FLY_TO_GLOBAL
-                        self.target_point_sent = False
+                        self._move_sent = False
                         return None
                 else:
                     self.state = InsertState.NEXT
@@ -365,32 +292,129 @@ class InsertMission:
             target = self.targets[self.current_target_idx]
             marker = self._find_target_marker(markers, target['id_4x4'])
             if marker is None:
-                print("[Insert] Маркер потерян. Перехожу в режим ожидания (без отката).")
+                print("[Insert] Маркер потерян. Перехожу в режим ожидания.")
                 self.lost_during_movement = False
                 self.state = InsertState.WAITING_FOR_MARKER
                 self.waiting_start_time = time.time()
                 return None
-            self.last_marker_pos = self._get_marker_center(marker)
-            self.best_direction = (0.0, 0.0)
-            self.attempts = 0
-            self.consecutive_good = 0
-            self.stable_frames = 0
-            self.current_move_direction = (0.0, 0.0)
-            self.bad_directions = []
-            self.last_good_direction = (0.0, 0.0)
-            self.good_directions_history = []
+
+            self.centering_start_x = self.current_x
+            self.centering_start_y = self.current_y
+            self.centering.reset(self.centering_start_x, self.centering_start_y)
+            self.centering.last_marker_pos = self.centering.get_marker_center(marker)
             self.state = InsertState.CENTERING_NEXT_MOVE
             return None
+
+        elif self.state == InsertState.CENTERING_NEXT_MOVE:
+            target = self.targets[self.current_target_idx]
+            marker = self._find_target_marker(markers, target['id_4x4'])
+            if marker is None:
+                print("[Insert] Маркер потерян перед движением. Перехожу в ожидание.")
+                self.lost_during_movement = False
+                self.state = InsertState.WAITING_FOR_MARKER
+                self.waiting_start_time = time.time()
+                return None
+
+            centered, stable = self.centering.check_centered_stable(marker)
+            if centered:
+                print(f"[Insert] ✅ Маркер отцентрирован! stable_frames={stable}")
+                self.drone.set_manual_speed(0, 0, 0, 0)
+                self.state = InsertState.POST_CENTERING_PAUSE
+                self.centering_start_time = time.time()
+                self._move_sent = False
+                # Мигание будет активировано в POST_CENTERING_PAUSE
+                self._send_point(self.current_x, self.current_y, z=CENTERING_DESCENT_ALTITUDE)
+                return None
+
+            step = self.centering.get_centering_step(marker)
+            err_x, err_y = self.centering.get_current_error(marker)
+
+            if self.centering.current_move_direction == (0.0, 0.0) or self.centering.attempts >= CENTERING_MAX_ATTEMPTS:
+                if self.centering.attempts >= CENTERING_MAX_ATTEMPTS:
+                    print("[Insert] Достигнут лимит попыток. Сбрасываю историю.")
+                    self.centering.bad_directions = []
+                    self.centering.attempts = 0
+                dx, dy = self.centering.choose_direction(step, err_x, err_y)
+                self.centering.current_move_direction = (dx, dy)
+                self.centering.attempts = 0
+                print(f"[Insert] Пробую направление: ({dx:.2f}, {dy:.2f}) на высоте {self.current_z:.2f}")
+            else:
+                dx, dy = self.centering.current_move_direction
+
+            self.centering.last_marker_pos = self.centering.get_marker_center(marker)
+            new_x = self.centering_start_x + dx
+            new_y = self.centering_start_y + dy
+            self._send_point(new_x, new_y)
+            self.state = InsertState.CENTERING_WAITING
+            return None
+
+        elif self.state == InsertState.CENTERING_WAITING:
+            if not self._has_reached_point():
+                if time.time() - self._command_sent_time > 10.0:
+                    print("[Insert] Таймаут движения в CENTERING_WAITING.")
+                    self.state = InsertState.CENTERING_ANALYZE
+                return None
+
+            if not self._is_stopped():
+                return None
+
+            print("[Insert] Движение завершено и остановка стабильна. Анализируем.")
+            self.state = InsertState.CENTERING_ANALYZE
+            return None
+
+        elif self.state == InsertState.CENTERING_ANALYZE:
+            target = self.targets[self.current_target_idx]
+            marker = self._find_target_marker(markers, target['id_4x4'])
+            if marker is None:
+                print("[Insert] Маркер потерян после движения. Откат к начальной точке центрирования.")
+                self._send_point(self.centering_start_x, self.centering_start_y)
+                if self.centering.current_move_direction != (0.0, 0.0):
+                    self.centering.bad_directions.append(self.centering.current_move_direction)
+                self.centering.current_move_direction = (0.0, 0.0)
+                self.state = InsertState.ROLLBACK
+                return None
+
+            result, new_anchor_x, new_anchor_y = self.centering.analyze_after_move(
+                marker, self.current_x, self.current_y, self.centering.current_move_direction
+            )
+
+            if result == 'centered':
+                print("[Insert] ✅ Маркер уже центрирован! Завершаем.")
+                self.drone.set_manual_speed(0, 0, 0, 0)
+                self.state = InsertState.POST_CENTERING_PAUSE
+                self.centering_start_time = time.time()
+                self._move_sent = False
+                self._send_point(self.current_x, self.current_y, z=CENTERING_DESCENT_ALTITUDE)
+                return None
+
+            elif result == 'good':
+                self.centering_start_x = new_anchor_x
+                self.centering_start_y = new_anchor_y
+                self._decrease_height()
+                self.state = InsertState.CENTERING_NEXT_MOVE
+                return None
+
+            elif result == 'bad':
+                self._send_point(self.centering_start_x, self.centering_start_y)
+                self.centering.current_move_direction = (0.0, 0.0)
+                self.state = InsertState.ROLLBACK
+                return None
+
+            elif result == 'lost':
+                self.lost_during_movement = True
+                self.state = InsertState.WAITING_FOR_MARKER
+                self.waiting_start_time = time.time()
+                return None
 
         elif self.state == InsertState.WAITING_FOR_MARKER:
             target = self.targets[self.current_target_idx]
             marker = self._find_target_marker(markers, target['id_4x4'])
             if marker is not None:
                 print("[Insert] ✅ Маркер снова виден! Продолжаю центрирование.")
-                self.last_marker_pos = self._get_marker_center(marker)
-                self.attempts = 0
-                self.stable_frames = 0
-                self.current_move_direction = (0.0, 0.0)
+                self.centering.last_marker_pos = self.centering.get_marker_center(marker)
+                self.centering.attempts = 0
+                self.centering.stable_frames = 0
+                self.centering.current_move_direction = (0.0, 0.0)
                 self.lost_during_movement = False
                 self.state = InsertState.CENTERING_NEXT_MOVE
                 return None
@@ -398,13 +422,13 @@ class InsertMission:
             timeout = TIMEOUT_MARKER_LOST_MOVEMENT if self.lost_during_movement else TIMEOUT_MARKER_LOST
             if time.time() - self.waiting_start_time > timeout:
                 if self.lost_during_movement:
-                    print(f"[Insert] ⏱ Маркер не появился за {TIMEOUT_MARKER_LOST_MOVEMENT} секунды. Откатываюсь к якорю.")
+                    print(f"[Insert] ⏱ Маркер не появился за {TIMEOUT_MARKER_LOST_MOVEMENT}с. Откат.")
                     self.lost_during_movement = False
-                    self._send_point(self.anchor_x, self.anchor_y)
+                    self._send_point(self.centering_start_x, self.centering_start_y)
                     self.state = InsertState.ROLLBACK
                     return None
                 else:
-                    print(f"[Insert] ⏱ Маркер не появился за {TIMEOUT_MARKER_LOST} секунд. Перехожу в полноценный поиск.")
+                    print(f"[Insert] ⏱ Маркер не появился за {TIMEOUT_MARKER_LOST}с. Перехожу в поиск.")
                     self.lost_during_movement = False
                     self.state = InsertState.SEARCHING
                     self.search_start_time = time.time()
@@ -415,184 +439,87 @@ class InsertMission:
 
         elif self.state == InsertState.ROLLBACK:
             if not self._has_reached_point():
-                return None
-            print("[Insert] Откат выполнен. Продолжаю центрирование с новым направлением.")
-            self.state = InsertState.CENTERING_NEXT_MOVE
-            self.current_move_direction = (0.0, 0.0)
-            self.attempts += 1
-            return None
-
-        elif self.state == InsertState.CENTERING_NEXT_MOVE:
-            target = self.targets[self.current_target_idx]
-            marker = self._find_target_marker(markers, target['id_4x4'])
-            if marker is None:
-                print("[Insert] Маркер потерян перед движением. Перехожу в ожидание (без отката).")
-                self.lost_during_movement = False
-                self.state = InsertState.WAITING_FOR_MARKER
-                self.waiting_start_time = time.time()
-                return None
-
-            mx, my = marker['center']
-            cx, cy = self.frame_w / 2, self.frame_h / 2
-            err_x = mx - cx
-            err_y = my - cy
-            print(f"[Insert] Центрирование: err_x={err_x:.1f}, err_y={err_y:.1f}, stable={self.stable_frames}")
-
-            if self._is_marker_centered(marker):
-                self.stable_frames += 1
-                print(f"[Insert] Маркер в центре! stable_frames={self.stable_frames}/{REQUIRED_STABLE_FRAMES}")
-                if self.stable_frames >= REQUIRED_STABLE_FRAMES:
-                    print("[Insert] ✅ Маркер отцентрирован! Опускаюсь до 1.5 м.")
-                    self.drone.set_manual_speed(0, 0, 0, 0)
-                    self.state = InsertState.POST_CENTERING_PAUSE
-                    self.centering_start_time = time.time()
-                    self._point_reached_checked = False
-                    self._send_point(self.current_x, self.current_y, z=CENTERING_DESCENT_ALTITUDE)
-                    return None
-            else:
-                if abs(err_x) < 100 and abs(err_y) < 100:
-                    self.stable_frames += 1
-                    print(f"[Insert] Почти центрирован (err<100): stable_frames={self.stable_frames}/{REQUIRED_STABLE_FRAMES}")
-                    if self.stable_frames >= REQUIRED_STABLE_FRAMES:
-                        print("[Insert] ✅ Маркер почти в центре (err<100). Принудительно перехожу к спуску.")
-                        self.drone.set_manual_speed(0, 0, 0, 0)
-                        self.state = InsertState.POST_CENTERING_PAUSE
-                        self.centering_start_time = time.time()
-                        self._point_reached_checked = False
-                        self._send_point(self.current_x, self.current_y, z=CENTERING_DESCENT_ALTITUDE)
-                        return None
-                else:
-                    self.stable_frames = 0
-
-            step = self._get_centering_step(marker)
-
-            if self.current_move_direction == (0.0, 0.0) or self.attempts >= CENTERING_MAX_ATTEMPTS:
-                if self.attempts >= CENTERING_MAX_ATTEMPTS:
-                    print("[Insert] Достигнут лимит попыток. Сбрасываю историю плохих направлений.")
-                    self.bad_directions = []
-                    self.attempts = 0
-                dx, dy = self._choose_direction(step)
-                self.current_move_direction = (dx, dy)
-                self.attempts = 0
-                print(f"[Insert] Пробую направление: ({dx:.2f}, {dy:.2f}) на высоте {self.current_z:.2f}")
-            else:
-                dx, dy = self.current_move_direction
-
-            self.last_marker_pos = self._get_marker_center(marker)
-            new_x = self.anchor_x + dx
-            new_y = self.anchor_y + dy
-            self._send_point(new_x, new_y)
-            self.state = InsertState.CENTERING_WAITING
-            return None
-
-        elif self.state == InsertState.CENTERING_WAITING:
-            if not self._has_reached_point():
-                if time.time() - self.command_sent_time > 10.0:
-                    print("[Insert] Таймаут движения, считаем неудачей.")
-                    self.state = InsertState.CENTERING_ANALYZE
-                return None
-
-            target = self.targets[self.current_target_idx]
-            marker = self._find_target_marker(markers, target['id_4x4'])
-            if marker is None:
-                print(f"[Insert] Маркер потерян после движения. Жду {TIMEOUT_MARKER_LOST_MOVEMENT} секунды, затем откат.")
-                self.lost_during_movement = True
-                self.state = InsertState.WAITING_FOR_MARKER
-                self.waiting_start_time = time.time()
-                return None
-
-            print("[Insert] Движение завершено. Анализирую результат.")
-            self.state = InsertState.CENTERING_ANALYZE
-            return None
-
-        elif self.state == InsertState.CENTERING_ANALYZE:
-            target = self.targets[self.current_target_idx]
-            marker = self._find_target_marker(markers, target['id_4x4'])
-            if marker is None:
-                print("[Insert] Маркер потерян после движения. Откатываюсь к якорю.")
-                self._send_point(self.anchor_x, self.anchor_y)
-                self.attempts += 1
-                self.current_move_direction = (0.0, 0.0)
-                if self.current_move_direction != (0.0, 0.0):
-                    self.bad_directions.append(self.current_move_direction)
-                self.state = InsertState.ROLLBACK
-                return None
-
-            if self._is_marker_centered(marker):
-                print("[Insert] ✅ Маркер уже центрирован! Завершаем центрирование.")
-                self.drone.set_manual_speed(0, 0, 0, 0)
-                self.state = InsertState.POST_CENTERING_PAUSE
-                self.centering_start_time = time.time()
-                self._point_reached_checked = False
-                self._send_point(self.current_x, self.current_y, z=CENTERING_DESCENT_ALTITUDE)
-                return None
-
-            new_marker_pos = self._get_marker_center(marker)
-            if self.last_marker_pos is None:
-                print("[Insert] Нет предыдущего замера, считаем неудачей.")
-                self._send_point(self.anchor_x, self.anchor_y)
-                self.attempts += 1
-                self.current_move_direction = (0.0, 0.0)
-                if self.current_move_direction != (0.0, 0.0):
-                    self.bad_directions.append(self.current_move_direction)
-                self.state = InsertState.ROLLBACK
-            else:
-                old_dist = self._get_marker_distance_to_center_from_pos(self.last_marker_pos)
-                new_dist = self._get_marker_distance_to_center_from_pos(new_marker_pos)
-                if new_dist < old_dist:
-                    self.last_good_direction = self.current_move_direction
-                    self.good_directions_history.append(self.current_move_direction)
-                    if len(self.good_directions_history) > 3:
-                        self.good_directions_history.pop(0)
-                    self.anchor_x = self.current_x
-                    self.anchor_y = self.current_y
-                    print(f"[Insert] Хорошее направление! Расстояние: {old_dist:.1f} -> {new_dist:.1f}")
-                    self._decrease_height()
-                    self.attempts = 0
+                if time.time() - self._command_sent_time > 10.0:
+                    print("[Insert] Таймаут отката, принудительный переход.")
+                    self._move_sent = False
                     self.state = InsertState.CENTERING_NEXT_MOVE
-                else:
-                    print(f"[Insert] Плохое направление. Расстояние: {old_dist:.1f} -> {new_dist:.1f}")
-                    if self.current_move_direction != (0.0, 0.0):
-                        self.bad_directions.append(self.current_move_direction)
-                    self._send_point(self.anchor_x, self.anchor_y)
-                    self.attempts += 1
-                    self.current_move_direction = (0.0, 0.0)
-                    self.state = InsertState.ROLLBACK
-
-            self.last_marker_pos = new_marker_pos
+                    self.centering.current_move_direction = (0.0, 0.0)
+                    self.centering.attempts += 1
+                return None
+            if not self._is_stopped():
+                return None
+            print("[Insert] Откат выполнен. Продолжаю центрирование.")
+            self.state = InsertState.CENTERING_NEXT_MOVE
+            self.centering.current_move_direction = (0.0, 0.0)
+            self.centering.attempts += 1
             return None
 
         elif self.state == InsertState.POST_CENTERING_PAUSE:
-            if not self._point_reached_checked:
-                if not self._has_reached_point():
-                    return None
-                self._point_reached_checked = True
+            if not self._move_sent:
+                # Активируем мигание зелёным для первой цели (после центрирования)
+                if self.current_target_idx == 0 and not self._blink_active:
+                    self._blink_active = True
+                    self._blink_start_time = time.time()
+                    self._blink_phase = 0
+                    self._blink_phase_start = time.time()
+                    self._blink_count = 0
+                    self._set_all_leds(0, 255, 0)
+                    self._blink_phase = 1
+                self._send_point(self.current_x, self.current_y, z=CENTERING_DESCENT_ALTITUDE)
+                return None
+
+            if not self._has_reached_point():
+                if time.time() - self._command_sent_time > self.descent_timeout:
+                    print("[Insert] Таймаут снижения, считаем достигнутым.")
+                    self._move_sent = False
+                return None
+
+            if not self._is_stopped():
+                return None
+
             if time.time() - self.centering_start_time < CENTERING_PAUSE_AFTER:
                 if not self._msg_printed:
-                    print("[Insert] Ожидание 10 секунд на высоте 1.5 м...")
+                    print("[Insert] Ожидание 10 сек на высоте 1.5 м...")
                     self._msg_printed = True
                 return None
-            print("[Insert] Пауза завершена. Обновляем карту с флагом is_centered=True.")
+
+            print("[Insert] Пауза завершена. Обновляем карту.")
             self._msg_printed = False
             self._update_current_target_position(is_centered=True)
             self.state = InsertState.UPDATE_MAP
             return None
 
         elif self.state == InsertState.CENTERED_PAUSE:
-            # Проверяем достижение точки только один раз
-            if not self._point_reached_checked:
-                if not self._has_reached_point():
-                    return None
-                self._point_reached_checked = True
-            # Теперь ждём 10 секунд
+            if not self._move_sent:
+                # Активируем мигание зелёным для первой цели (если уже центрирована)
+                if self.current_target_idx == 0 and not self._blink_active:
+                    self._blink_active = True
+                    self._blink_start_time = time.time()
+                    self._blink_phase = 0
+                    self._blink_phase_start = time.time()
+                    self._blink_count = 0
+                    self._set_all_leds(0, 255, 0)
+                    self._blink_phase = 1
+                self._send_point(self.current_x, self.current_y, z=CENTERING_DESCENT_ALTITUDE)
+                return None
+
+            if not self._has_reached_point():
+                if time.time() - self._command_sent_time > self.descent_timeout:
+                    print("[Insert] Таймаут снижения (уже центрирована).")
+                    self._move_sent = False
+                return None
+
+            if not self._is_stopped():
+                return None
+
             if time.time() - self.centering_start_time < CENTERING_PAUSE_AFTER:
                 if not self._msg_printed:
-                    print("[Insert] Цель уже центрирована. Ожидание 10 секунд на высоте 1.5 м...")
+                    print("[Insert] Цель уже центрирована. Ожидание 10 сек...")
                     self._msg_printed = True
                 return None
-            print("[Insert] Пауза завершена. Обновляем карту (сохраняем is_centered=True).")
+
+            print("[Insert] Пауза завершена. Обновляем карту (is_centered=True).")
             self._msg_printed = False
-            # Выключаем светодиоды, если мигание ещё активно
             if self._blink_active:
                 self._set_all_leds(0, 0, 0)
                 self._blink_active = False
@@ -614,8 +541,8 @@ class InsertMission:
             self.current_target_idx += 1
             if self.current_target_idx < len(self.targets):
                 self.state = InsertState.FLY_TO_GLOBAL
-                self.target_point_sent = False
-                self._point_reached_checked = False
+                self._move_sent = False
+                self._target_reached = False
             else:
                 print("[Insert] Все цели обработаны. Возврат на базу.")
                 self._send_point(0, 0, z=DEFAULT_ALTITUDE)
@@ -623,7 +550,7 @@ class InsertMission:
             return None
 
         elif self.state == InsertState.RETURN_HOME:
-            if self._has_reached_point():
+            if self._has_reached_point() and self._is_stopped():
                 print("[Insert] Возврат на базу выполнен. Миссия завершена.")
                 self.state = InsertState.DONE
             return None

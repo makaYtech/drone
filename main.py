@@ -11,6 +11,8 @@ from camera.camera_utils import CameraManager
 from camera.aruco.detector import ArUcoDetector
 from control.drone_global_control import DroneGlobalController
 from utils import generate_report_from_map
+from outside.mission import Mission
+from outside.insert import InsertMission
 
 # Настройка логирования
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -69,7 +71,7 @@ def main():
     mission.start()
 
     # Если миссия разведки – развернуть дрон на 180° (опционально)
-    if type(mission).__name__ == 'Mission':
+    if isinstance(mission, Mission):
         drone.go_to_point(0, 0, DEFAULT_ALTITUDE, np.radians(180))
 
     # 4. Главный цикл
@@ -83,32 +85,66 @@ def main():
             vis_frame, markers = detector.process_frame(frame)
             status = mission.update(markers)
 
-            if status == 'done':
-                logger.info("Миссия завершена, выполняем посадку...")
-                if hasattr(mission, 'get_results'):
+            # --- Обработка клавиши 'n' для принудительного перехода в Insert ---
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('n'):
+                if isinstance(mission, Mission):
+                    # Принудительно завершаем Exploration и переходим в Insert
+                    logger.info("Принудительный переход из Exploration в Insert по нажатию 'n'.")
+                    # Завершаем текущую миссию (можно вызвать status = 'done' или просто остановить)
+                    # Лучше принудительно закрыть миссию, установив состояние DONE
+                    # Но так как Mission не имеет метода stop, мы заменим её на Insert.
                     results = mission.get_results()
-                    logger.info("Собрано групп: %d", len(results))
+                    if results and len(results) > 0:
+                        # Создаём InsertMission с тем же marker_handler
+                        insert_mission = InsertMission(drone, mission.marker_handler, frame_w=640, frame_h=480)
+                        insert_mission.start()
+                        mission = insert_mission
+                        logger.info("InsertMission запущена после принудительного перехода.")
+                    else:
+                        logger.info("Нет маркеров для уточнения. Завершаем программу.")
+                        break
+                else:
+                    logger.info("Нажата 'n', но миссия не Exploration. Игнорирую.")
+                # После смены миссии продолжаем цикл (переходим к следующей итерации)
+                continue
 
-                generate_report_from_map(MAP_FILE, "report.txt")
-                drone.land()
-                time.sleep(2)
+            elif key == ord('q'):
+                logger.info("Принудительная остановка по нажатию 'q'")
                 break
+
+            if status == 'done':
+                # Проверяем, была ли это Exploration-миссия
+                if isinstance(mission, Mission):
+                    results = mission.get_results()
+                    if results and len(results) > 0:
+                        logger.info("Exploration завершена. Начинаем InsertMission для уточнения позиций.")
+                        insert_mission = InsertMission(drone, mission.marker_handler, frame_w=640, frame_h=480)
+                        insert_mission.start()
+                        mission = insert_mission  # подменяем текущую миссию
+                        continue  # продолжаем цикл без посадки
+                    else:
+                        logger.info("Нет маркеров для уточнения. Завершаем.")
+                        break
+                else:
+                    # Это InsertMission, завершаем
+                    logger.info("InsertMission завершена. Выполняем посадку...")
+                    break
 
             cv2.imshow("ArUco Detection", vis_frame)
-            if cv2.waitKey(1) & 0xFF == ord('q'):
-                logger.info("Принудительная остановка по нажатию 'q'")
-                drone.land()
-                break
+            # Обработка клавиш уже выполнена выше, поэтому убираем дублирование cv2.waitKey
 
     except KeyboardInterrupt:
         logger.info("Остановка по Ctrl+C")
-        drone.land()
     except Exception as e:
         logger.error("Критическая ошибка: %s", e, exc_info=True)
-        drone.land()
     finally:
+        logger.info("Выполняем посадку...")
+        drone.land()
         cv2.destroyAllWindows()
         cam_mgr.release()
+        # Генерируем отчёт после завершения всех миссий
+        generate_report_from_map(MAP_FILE, "report.txt")
         logger.info("Программа завершена.")
 
 
