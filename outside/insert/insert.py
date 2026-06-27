@@ -76,10 +76,10 @@ class InsertMission:
         # Параметры мигания светодиодами
         self._blink_active = False
         self._blink_start_time = 0.0
-        self._blink_phase = 0          # 0 = выкл, 1 = вкл
+        self._blink_phase = 0
         self._blink_phase_start = 0.0
-        self._blink_count = 0          # сколько раз моргнули (0..3)
-        self._blink_duration = 0.5     # длительность одной фазы (вкл/выкл)
+        self._blink_count = 0
+        self._blink_duration = 0.5
 
     def start(self):
         self.state = InsertState.INIT
@@ -280,6 +280,10 @@ class InsertMission:
             if time.time() - self.command_sent_time > 30.0:
                 print("[Insert] Таймаут достижения точки в FLY_TO_GLOBAL. Принудительно перехожу к стабилизации.")
                 self.target_point_sent = False
+                # Сохраняем текущие координаты как опорные для центрирования
+                self.anchor_x = self.current_x
+                self.anchor_y = self.current_y
+                self.anchor_z = self.current_z
                 self.state = InsertState.STABILIZE
                 self.centering_start_time = time.time()
                 return None
@@ -289,7 +293,7 @@ class InsertMission:
                     print(f"[Insert] Прибыли в точку {self.current_target_idx+1} (уже центрирована). Ожидание 10 сек.")
                     self.state = InsertState.CENTERED_PAUSE
                     self.centering_start_time = time.time()
-                    self._point_reached_checked = True   # точка уже достигнута
+                    self._point_reached_checked = False   # сбрасываем для проверки
                     self._msg_printed = False
 
                     # Инициализируем мигание (только для первой цели)
@@ -575,7 +579,12 @@ class InsertMission:
             return None
 
         elif self.state == InsertState.CENTERED_PAUSE:
-            # Так как точка уже достигнута, просто ждём таймер
+            # Проверяем достижение точки только один раз
+            if not self._point_reached_checked:
+                if not self._has_reached_point():
+                    return None
+                self._point_reached_checked = True
+            # Теперь ждём 10 секунд
             if time.time() - self.centering_start_time < CENTERING_PAUSE_AFTER:
                 if not self._msg_printed:
                     print("[Insert] Цель уже центрирована. Ожидание 10 секунд на высоте 1.5 м...")
