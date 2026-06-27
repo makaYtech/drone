@@ -11,6 +11,7 @@ from constants import (
 )
 from outside.centering_controller import CenteringController
 
+
 class InsertState(Enum):
     INIT = 0
     FLY_TO_GLOBAL = 1
@@ -67,6 +68,9 @@ class InsertMission:
         self._blink_count = 0
         self._blink_duration = 0.5
 
+        # Флаг для вывода сообщений "Запуск нейросети" и "Загрузка целей" один раз за цель
+        self._start_message_printed = False
+
         self.centering = CenteringController(frame_w, frame_h)
 
     def start(self):
@@ -74,6 +78,13 @@ class InsertMission:
         print("[Insert] Миссия запущена (оптимизированная версия).")
 
     # ---- Вспомогательные методы ----
+    def _print_start_message(self):
+        """Выводит сообщения один раз за текущую цель."""
+        if not self._start_message_printed:
+            print("Запуск нейросети")
+            print("Загрузка целей")
+            self._start_message_printed = True
+
     def _load_targets(self):
         self.targets = self.marker_handler.map_data[:]
         print(f"[Insert] Загружено {len(self.targets)} целей.")
@@ -244,7 +255,6 @@ class InsertMission:
                 self.state = InsertState.CENTERED_PAUSE
                 self.centering_start_time = time.time()
                 self._msg_printed = False
-                # Мигание будет активировано в CENTERED_PAUSE
                 return None
             else:
                 self.state = InsertState.SEARCHING
@@ -322,8 +332,7 @@ class InsertMission:
                 self.state = InsertState.POST_CENTERING_PAUSE
                 self.centering_start_time = time.time()
                 self._move_sent = False
-                # Мигание будет активировано в POST_CENTERING_PAUSE
-                self._send_point(self.current_x, self.current_y, z=CENTERING_DESCENT_ALTITUDE)
+                # Не отправляем точку сразу, дождёмся следующего кадра для вывода сообщений
                 return None
 
             step = self.centering.get_centering_step(marker)
@@ -384,7 +393,6 @@ class InsertMission:
                 self.state = InsertState.POST_CENTERING_PAUSE
                 self.centering_start_time = time.time()
                 self._move_sent = False
-                self._send_point(self.current_x, self.current_y, z=CENTERING_DESCENT_ALTITUDE)
                 return None
 
             elif result == 'good':
@@ -455,6 +463,9 @@ class InsertMission:
             return None
 
         elif self.state == InsertState.POST_CENTERING_PAUSE:
+            # Выводим стартовое сообщение при первом входе в это состояние
+            self._print_start_message()
+
             if not self._move_sent:
                 # Активируем мигание зелёным для первой цели (после центрирования)
                 if self.current_target_idx == 0 and not self._blink_active:
@@ -465,6 +476,7 @@ class InsertMission:
                     self._blink_count = 0
                     self._set_all_leds(0, 255, 0)
                     self._blink_phase = 1
+                # Отправляем точку снижения
                 self._send_point(self.current_x, self.current_y, z=CENTERING_DESCENT_ALTITUDE)
                 return None
 
@@ -490,6 +502,9 @@ class InsertMission:
             return None
 
         elif self.state == InsertState.CENTERED_PAUSE:
+            # Выводим стартовое сообщение при первом входе в это состояние
+            self._print_start_message()
+
             if not self._move_sent:
                 # Активируем мигание зелёным для первой цели (если уже центрирована)
                 if self.current_target_idx == 0 and not self._blink_active:
@@ -539,6 +554,8 @@ class InsertMission:
 
         elif self.state == InsertState.NEXT:
             self.current_target_idx += 1
+            # Сбрасываем флаг для следующей цели, чтобы сообщения вывелись снова
+            self._start_message_printed = False
             if self.current_target_idx < len(self.targets):
                 self.state = InsertState.FLY_TO_GLOBAL
                 self._move_sent = False
